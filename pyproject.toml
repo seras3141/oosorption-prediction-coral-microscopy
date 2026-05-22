@@ -40,6 +40,9 @@ ml = [
     "ultralytics>=8.3",
     "torchstain>=1.4",
 ]
+sharepoint = [
+    "msal>=1.28",
+]
 
 [project.scripts]
 coral-download-ndpi = "scripts.download_ndpi:main"
@@ -47,6 +50,7 @@ coral-remap-annotations = "scripts.remap_annotations:main"
 coral-generate-tiles = "scripts.generate_tiles:main"
 coral-geojson-to-yolo = "scripts.geojson_to_yolo:main"
 coral-extract-rois = "scripts.extract_ndpi_rois:main"
+coral-download-geojson = "scripts.download_geojson:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/data_preparation", "scripts"]
