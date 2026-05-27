@@ -1,43 +1,36 @@
 #!/usr/bin/env python3
-"""
-Extract high-contrast regions of interest (ROIs) from NDPI whole-slide images and save as TIFF patches.
+"""Extract tissue cuts from NDPI whole-slide images and write a _cuts.json manifest.
 
-Approach:
-- Use OpenSlide to read NDPI files (requires OpenSlide C library installed on the system).
-- Create a reasonably-sized thumbnail for fast processing.
-- Use OpenCV to detect contours in the thumbnail based on edge/contrast (Canny + morphological ops).
-- Map thumbnail contour bounding boxes back to level-0 coordinates and extract high-resolution regions with OpenSlide.
-- Save extracted regions as TIFFs (one file per ROI) using PIL/Tifffile.
+Delegates to src.data_preparation.extract_ndpi_cuts.extract_specimen_cuts, which
+writes pyramidal TIFFs named ``{stem}_cut{i:03d}.tif`` (0-based) and a
+``{stem}_cuts.json`` manifest consumed by coral-remap-annotations and
+coral-generate-tiles.
 
 Usage:
-    python scripts/extract_ndpi_rois.py --input /path/to/CHN_W_2_1-3.ndpi --outdir /path/to/out
-
-Key options (see CLI help): min-area, padding, thumbnail-max-dim, edge_thresh1/2
-
+    uv run coral-extract-rois --input /path/to/CHN_W_2_1-3.ndpi --outdir data/cuts
 """
 
-import glob
 import argparse
+import glob
+import logging
 import math
 import os
+import sys
 from pathlib import Path
-import logging
-import cv2
-import openslide
-import tifffile
-from skimage.measure import label, regionprops
 from typing import List
 
-from PIL import Image
+import cv2
 import numpy as np
+import openslide
+import tifffile
+from PIL import Image
+from skimage.measure import label, regionprops
 
-# try:
-#     import openslide
-# except Exception as e:  # pragma: no cover - informative
-#     raise RuntimeError(
-#         "openslide Python bindings are required. Install OpenSlide C library (e.g. `brew install openslide`) and `pip install openslide-python`."
-    # )
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
+from src.data_preparation.extract_ndpi_cuts import extract_specimen_cuts
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 
@@ -335,26 +328,26 @@ def main():
     args = parse_args()
     inp = Path(args.input)
     outdir = Path(args.outdir)
-    ensure_outdir(outdir)
 
-    targets = []
-    if inp.is_dir():
-        images = get_ndpi_images(inp)
-        for img in images:
-            if f.suffix.lower() in ('.ndpi',):
-                targets.append(f)
-    elif inp.is_file():
-        targets.append(inp)
+    if inp.is_file():
+        targets = [inp]
+    elif inp.is_dir():
+        targets = sorted(inp.glob("*.ndpi"))
     else:
-        raise FileNotFoundError(f'Input path not found: {inp}')
+        raise FileNotFoundError(f"Input path not found: {inp}")
 
     if not targets:
-        logging.warning('No NDPI files found under %s', inp)
+        logging.warning("No NDPI files found under %s", inp)
         return
 
-    for t in targets:
-        file_outdir = outdir / t.stem
-        process_file(t, file_outdir, min_area=args.min_area, padding=args.padding, thumb_max_dim=args.thumb_max_dim, edge_thresh1=args.edge_thresh1, edge_thresh2=args.edge_thresh2)
+    for ndpi_path in targets:
+        logging.info("Processing %s", ndpi_path.name)
+        extract_specimen_cuts(
+            ndpi_path,
+            outdir / ndpi_path.stem,
+            output_format="pyramidal",
+            write_manifest=True,
+        )
 
 
 if __name__ == '__main__':

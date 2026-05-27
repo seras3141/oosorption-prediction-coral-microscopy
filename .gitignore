@@ -15,5 +15,7 @@ review_sessions/
 .DS_Store
 .python-version
 
+data
 data/
 slurm/
+uv.lock
