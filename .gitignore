@@ -14,3 +14,6 @@ review_sessions/
 .streamlit/config.toml
 .DS_Store
 .python-version
+
+data/
+slurm/

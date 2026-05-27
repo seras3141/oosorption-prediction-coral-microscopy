@@ -16,7 +16,9 @@ PANGAEA datasets
 from __future__ import annotations
 
 import argparse
+import errno
 import sys
+import time
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -33,6 +35,8 @@ DEFAULT_GEOJSON_DIR = Path(__file__).parent.parent / "data" / "dataset_28_04"
 DEFAULT_OUT_DIR = Path(__file__).parent.parent / "data" / "ndpi"
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 USER_AGENT = "Mozilla/5.0 (compatible; coral-microscopy-downloader/0.1)"
+MAX_RETRIES = 3
+RETRY_DELAYS = (10, 30, 60)  # seconds between successive attempts
 
 
 # ---------------------------------------------------------------------------
@@ -54,46 +58,70 @@ def location_prefix(stem: str) -> str | None:
 
 
 def download_file(url: str, dest: Path, *, verbose: bool = True) -> bool:
-    """Download *url* to *dest*.  Returns True on success."""
+    """Download *url* to *dest*.  Returns True on success.
+
+    Retries up to MAX_RETRIES times on network errors (e.g. EHOSTUNREACH).
+    HTTP errors (4xx/5xx) are not retried.
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp_dest = dest.with_name(f"{dest.name}.part")
-    try:
-        if verbose:
-            print(f"  Downloading {url}")
-            print(f"          → {dest}")
 
-        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(request) as response, tmp_dest.open("wb") as out:
-            total_size = int(response.headers.get("Content-Length") or 0)
-            downloaded = 0
-            while True:
-                chunk = response.read(DOWNLOAD_CHUNK_SIZE)
-                if not chunk:
-                    break
-                out.write(chunk)
-                downloaded += len(chunk)
-                _print_progress(downloaded, total_size, verbose=verbose)
+    if verbose:
+        print(f"  Downloading {url}")
+        print(f"          → {dest}")
 
-        tmp_dest.replace(dest)
-        if verbose:
-            print()  # newline after progress bar
-        return True
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(request) as response, tmp_dest.open("wb") as out:
+                total_size = int(response.headers.get("Content-Length") or 0)
+                downloaded = 0
+                while True:
+                    chunk = response.read(DOWNLOAD_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    downloaded += len(chunk)
+                    _print_progress(downloaded, total_size, verbose=verbose)
 
-    except urllib.error.HTTPError as exc:
-        if verbose:
-            print(f"\n  ERROR {exc.code}: {exc.reason}  ({url})")
-        return False
-    except urllib.error.URLError as exc:
-        if verbose:
-            print(f"\n  ERROR: {exc.reason}  ({url})")
-        return False
-    except OSError as exc:
-        if verbose:
-            print(f"\n  ERROR: {exc}  ({url})")
-        return False
-    finally:
-        if tmp_dest.exists():
-            tmp_dest.unlink()
+            tmp_dest.replace(dest)
+            if verbose:
+                print()  # newline after progress bar
+            return True
+
+        except urllib.error.HTTPError as exc:
+            if verbose:
+                print(f"\n  ERROR {exc.code}: {exc.reason}  ({url})")
+            # Retry on transient server errors (5xx, 429); give up on client errors (4xx)
+            if exc.code in (429, 500, 502, 503, 504) and attempt < MAX_RETRIES:
+                delay = RETRY_DELAYS[attempt - 1]
+                if verbose:
+                    print(f"  Retrying in {delay}s (attempt {attempt}/{MAX_RETRIES})...")
+                if tmp_dest.exists():
+                    tmp_dest.unlink()
+                time.sleep(delay)
+            else:
+                break
+
+        except (urllib.error.URLError, OSError) as exc:
+            if verbose:
+                print(f"\n  ERROR: {exc.reason if hasattr(exc, 'reason') else exc}  ({url})")
+            # Disk quota / no space — fatal, abort immediately
+            if isinstance(exc, OSError) and exc.errno in (errno.EDQUOT, errno.ENOSPC):
+                raise
+            if attempt < MAX_RETRIES:
+                delay = RETRY_DELAYS[attempt - 1]
+                if verbose:
+                    print(f"  Retrying in {delay}s (attempt {attempt}/{MAX_RETRIES})...")
+                if tmp_dest.exists():
+                    tmp_dest.unlink()
+                time.sleep(delay)
+
+        finally:
+            if tmp_dest.exists():
+                tmp_dest.unlink()
+
+    return False
 
 
 def _print_progress(downloaded: int, total_size: int, *, verbose: bool) -> None:
@@ -175,6 +203,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Directory where NDPI files will be saved.",
     )
     parser.add_argument(
+        "--inter-file-delay",
+        type=int,
+        default=90,
+        metavar="SECONDS",
+        help="Seconds to wait between successive downloads (avoids server rate-limiting).",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print what would be downloaded without actually downloading.",
@@ -211,9 +246,17 @@ def main(argv: list[str] | None = None) -> int:
     failed: list[str] = []
     for i, (url, dest) in enumerate(todo, 1):
         print(f"[{i}/{len(todo)}] {dest.name}")
-        ok = download_file(url, dest)
+        try:
+            ok = download_file(url, dest)
+        except OSError as exc:
+            print(f"\nFATAL: {exc} — aborting.", file=sys.stderr)
+            print("Free up disk space or request a higher quota, then re-run.", file=sys.stderr)
+            return 1
         if not ok:
             failed.append(dest.name)
+        elif i < len(todo):
+            print(f"  Waiting {args.inter_file_delay}s before next download...")
+            time.sleep(args.inter_file_delay)
 
     print()
     if failed:
