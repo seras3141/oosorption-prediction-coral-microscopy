@@ -13,6 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from app.build_review_html import build_review_html
 from src.data_preparation.sample_review_tiles import (
     DEFAULT_MIN_TISSUE_FRACTION,
     DEFAULT_NEGATIVE_BUFFER_FRACTION,
@@ -25,7 +26,7 @@ from src.data_preparation.sample_review_tiles import (
 
 LOG_FORMAT = "[%(levelname)s] %(message)s"
 DEFAULT_CUTS_DIR = Path("data/cuts")
-DEFAULT_OUTPUT_DIR = Path("review_sessions")
+DEFAULT_OUTPUT_DIR = Path("data/review_sessions")
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 
 
@@ -93,6 +94,11 @@ def parse_args() -> argparse.Namespace:
         help="Create a ZIP archive next to the written session directory.",
     )
     parser.add_argument(
+        "--html",
+        action="store_true",
+        help="Build a self-contained review.html inside the session directory (no pip install needed).",
+    )
+    parser.add_argument(
         "--log-level",
         choices=LOG_LEVELS,
         default="INFO",
@@ -131,8 +137,9 @@ def main() -> int:
 
     session_dir = _resolve_session_dir(args.output_dir, manifest["session_id"])
     zip_path = _zip_session_dir(session_dir) if args.zip else None
+    html_path = build_review_html(session_dir) if args.html else None
 
-    _print_summary(manifest, session_dir=session_dir, zip_path=zip_path)
+    _print_summary(manifest, session_dir=session_dir, zip_path=zip_path, html_path=html_path)
     return 0
 
 
@@ -154,7 +161,9 @@ def _zip_session_dir(session_dir: Path) -> Path:
     return Path(archive_path)
 
 
-def _print_summary(manifest: dict, *, session_dir: Path, zip_path: Path | None) -> None:
+def _print_summary(
+    manifest: dict, *, session_dir: Path, zip_path: Path | None, html_path: Path | None
+) -> None:
     """Print a compact review-session summary table."""
     print(f"Session:  {manifest['session_id']}")
     print(f"Location: {_display_path(session_dir)}")
@@ -166,6 +175,9 @@ def _print_summary(manifest: dict, *, session_dir: Path, zip_path: Path | None) 
     if zip_path is not None:
         size_mb = zip_path.stat().st_size / (1024 * 1024)
         print(f"ZIP:      {_display_path(zip_path)}  ({size_mb:.1f} MB)")
+    if html_path is not None:
+        size_mb = html_path.stat().st_size / (1024 * 1024)
+        print(f"HTML:     {_display_path(html_path)}  ({size_mb:.1f} MB)")
 
     print()
     print(f"{'Size':>6} {'Positive':>9} {'Negative':>9} {'Sources':>8}")
@@ -177,9 +189,16 @@ def _print_summary(manifest: dict, *, session_dir: Path, zip_path: Path | None) 
         print(f"{tile_size:6d} {positives:9d} {negatives:9d} {sources:8d}")
 
     print()
-    print("Share the session directory or ZIP with the collaborator.")
-    print("Run the review app with:")
-    print(f"  streamlit run app/review_tiles.py -- --session {_display_path(session_dir)}")
+    if html_path is not None:
+        print("Share review.html with the collaborator — no installation needed.")
+        print("They open it in any browser, label tiles, and download session.json when done.")
+    else:
+        print("Share the session directory or ZIP with the collaborator.")
+        print("Run the review app with:")
+        print(f"  streamlit run app/review_tiles.py -- --session {_display_path(session_dir)}")
+        print()
+        print("Or generate a self-contained HTML file (no pip install for the reviewer):")
+        print(f"  python app/build_review_html.py --session {_display_path(session_dir)}")
 
 
 def _display_path(path: Path) -> str:
