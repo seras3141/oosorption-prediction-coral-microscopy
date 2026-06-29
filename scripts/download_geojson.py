@@ -100,8 +100,9 @@ DEFAULT_SHARING_URL = (
 # Replace via --app-id if blocked by your organisation (see Troubleshooting above).
 DEFAULT_APP_ID = "04b07795-8542-4523-8734-1b68cf4af4f2"
 
-# 'organizations' accepts any Azure AD (work/school) account.
-DEFAULT_TENANT = "organizations"
+# Helmholtz Munich Azure AD tenant.  Change if the script is used from a
+# different organisation, or override at runtime with --tenant.
+DEFAULT_TENANT = "helmholtz-munich.de"
 
 # Microsoft Graph delegated scope for read access to files.
 GRAPH_SCOPES = ["https://graph.microsoft.com/Files.Read.All"]
@@ -519,7 +520,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--tenant",
         default=DEFAULT_TENANT,
-        help="Azure AD tenant ID, domain, or 'organizations'.",
+        help="Azure AD tenant domain or ID (e.g. 'helmholtz-munich.de').",
     )
     parser.add_argument(
         "--all-files",

@@ -45,6 +45,8 @@ SESSION_COUNTER_WIDTH: int = 3
 PNG_COUNTER_WIDTH: int = 3
 MAX_DISPLAY_SHUFFLE_ATTEMPTS: int = 512
 FEATURE_COLLECTION: str = "FeatureCollection"
+SESSION_META_FILENAME: str = "session_meta.json"
+LABELS_FILENAME: str = "labels.json"
 
 
 def sample_review_session(
@@ -64,7 +66,7 @@ def sample_review_session(
     For each tile size, samples ``n_positive_per_size`` tiles centred on
     annotated oocyte centroids and ``n_negative_per_size`` tiles from
     unannotated tissue regions. Exports PNG images and writes
-    ``session.json`` to ``output_dir / session_id``.
+    ``session_meta.json`` and ``labels.json`` to ``output_dir / session_id``.
 
     Parameters
     ----------
@@ -94,7 +96,8 @@ def sample_review_session(
     Returns
     -------
     dict of str to Any
-        Session manifest dict matching the written ``session.json``.
+        In-memory session metadata dict. A ``labels`` key is included for CLI
+        summaries, but the written ``session_meta.json`` keeps labels separate.
 
     Examples
     --------
@@ -285,8 +288,6 @@ def _sample_positive_tiles(
                 "ground_truth": True,
                 "n_oocytes_ground_truth": len(assigned_annotations),
                 "annotation_ids": [item["annotation_id"] for item in assigned_annotations],
-                "collaborator_label": None,
-                "labelled_at": None,
                 "tile_array": tile_arr,
             }
         )
@@ -359,8 +360,6 @@ def _collect_negative_candidates(
                         "ground_truth": False,
                         "n_oocytes_ground_truth": 0,
                         "annotation_ids": [],
-                        "collaborator_label": None,
-                        "labelled_at": None,
                         "tile_array": tile_arr,
                     }
                 )
@@ -519,15 +518,43 @@ def _adjacent_conflict_count(tiles: list[dict[str, Any]]) -> int:
     return conflicts
 
 
-def _write_session(session_dir: Path, manifest: dict[str, Any]) -> Path:
-    """Write the session manifest as JSON and return its path."""
+def _write_session(session_dir: Path, manifest: dict[str, Any]) -> tuple[Path, Path]:
+    """Write split review-session JSON files and return their paths."""
     session_dir.mkdir(parents=True, exist_ok=True)
     (session_dir / "tiles").mkdir(parents=True, exist_ok=True)
-    manifest_path = session_dir / "session.json"
-    with manifest_path.open("w", encoding="utf-8") as fp:
-        json.dump(manifest, fp, indent=2)
+    labels = _initial_labels_manifest(manifest)
+    meta_path = session_dir / SESSION_META_FILENAME
+    labels_path = session_dir / LABELS_FILENAME
+    _write_json_atomic(meta_path, manifest)
+    _write_json_atomic(labels_path, labels)
+    manifest["labels"] = labels["labels"]
+    return meta_path, labels_path
+
+
+def _initial_labels_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Return the collaborator-facing labels manifest for a session."""
+    return {
+        "session_id": manifest["session_id"],
+        "labels": [
+            {
+                "display_index": tile["display_index"],
+                "tile_id": tile["tile_id"],
+                "collaborator_label": None,
+                "labelled_at": None,
+            }
+            for tile in sorted(manifest["tiles"], key=lambda item: item["display_index"])
+        ],
+    }
+
+
+def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
+    """Atomically write a JSON object using a sibling temporary file."""
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    with tmp_path.open("w", encoding="utf-8") as fp:
+        json.dump(data, fp, indent=2)
         fp.write("\n")
-    return manifest_path
+        fp.flush()
+    tmp_path.replace(path)
 
 
 def _resolve_session_id(output_dir: Path, *, session_id: str | None) -> str:
@@ -537,13 +564,18 @@ def _resolve_session_id(output_dir: Path, *, session_id: str | None) -> str:
             raise ValueError(f"Session directory already exists: {output_dir / session_id}")
         return session_id
 
-    prefix = f"{datetime.now().date().isoformat()}_{SESSION_PREFIX}"
-    counter = 1
-    while True:
-        candidate = f"{prefix}{counter:0{SESSION_COUNTER_WIDTH}d}"
-        if not (output_dir / candidate).exists():
-            return candidate
-        counter += 1
+    import re
+
+    date_prefix = datetime.now().date().isoformat()
+    pattern = re.compile(rf"^\d{{4}}-\d{{2}}-\d{{2}}_{re.escape(SESSION_PREFIX)}(\d+)$")
+    max_counter = 0
+    if output_dir.exists():
+        for entry in output_dir.iterdir():
+            m = pattern.match(entry.name)
+            if m:
+                max_counter = max(max_counter, int(m.group(1)))
+    counter = max_counter + 1
+    return f"{date_prefix}_{SESSION_PREFIX}{counter:0{SESSION_COUNTER_WIDTH}d}"
 
 
 def _display_path(path: Path) -> str:

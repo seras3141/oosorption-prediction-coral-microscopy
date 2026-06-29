@@ -19,3 +19,7 @@ data
 data/
 slurm/
 uv.lock
+
+# Local scratch / dev artefacts
+tmp_test_tiles/
+example_usage.py

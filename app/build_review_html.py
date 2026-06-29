@@ -37,17 +37,19 @@ _HTML_TEMPLATE = """\
       color: #1a1a1a;
       min-height: 100vh;
     }}
-    #app {{
-      max-width: 580px;
+    .layout {{
+      display: flex;
+      gap: 2rem;
+      max-width: 960px;
       margin: 0 auto;
       padding: 2rem 1rem 4rem;
+      align-items: flex-start;
     }}
+    .col-image {{ flex: 3; min-width: 0; }}
+    .col-controls {{ flex: 1; min-width: 200px; }}
     h1 {{ font-size: 1.5rem; font-weight: 700; margin-bottom: 0.2rem; }}
-    .caption {{
-      color: #666;
-      font-size: 0.85rem;
-      margin-bottom: 1rem;
-    }}
+    h2 {{ font-size: 1rem; font-weight: 600; margin-bottom: 0.75rem; }}
+    .caption {{ color: #666; font-size: 0.85rem; margin-bottom: 1rem; }}
     .progress-wrap {{
       height: 6px;
       background: #d8dde4;
@@ -74,60 +76,64 @@ _HTML_TEMPLATE = """\
       display: block;
       image-rendering: pixelated;
     }}
-    .scale-caption {{
-      text-align: center;
-      color: #888;
-      font-size: 0.8rem;
-      margin-bottom: 1.25rem;
+    .scale-caption {{ text-align: center; color: #888; font-size: 0.8rem; }}
+    .status {{
+      border-radius: 6px;
+      padding: 0.6rem 0.75rem;
+      font-size: 0.85rem;
+      margin-bottom: 1rem;
     }}
+    .status-yes      {{ background: #e6f4ea; color: #1e6e35; border: 1px solid #a8d5b5; }}
+    .status-no       {{ background: #e8f0fe; color: #1a56cc; border: 1px solid #aac4f5; }}
+    .status-unlabelled {{ background: #fef9e7; color: #7a5c00; border: 1px solid #f0d980; }}
     .btn {{
       display: block;
       width: 100%;
       padding: 0.8rem 1rem;
-      font-size: 1rem;
+      font-size: 0.95rem;
       font-weight: 500;
       border-radius: 6px;
       border: 1px solid transparent;
       cursor: pointer;
       margin-bottom: 0.6rem;
-      transition: background 0.12s, box-shadow 0.12s;
+      transition: background 0.12s;
     }}
-    .btn:focus-visible {{
-      outline: 2px solid #1a73e8;
-      outline-offset: 2px;
+    .btn:focus-visible {{ outline: 2px solid #1a73e8; outline-offset: 2px; }}
+    .btn:disabled {{ opacity: 0.4; cursor: not-allowed; }}
+    .btn-yes {{ background: #1a73e8; color: #fff; border-color: #1a73e8; }}
+    .btn-yes:hover:not(:disabled) {{ background: #1558c0; border-color: #1558c0; }}
+    .btn-no {{ background: #fff; color: #1a1a1a; border-color: #bbc0c7; }}
+    .btn-no:hover:not(:disabled) {{ background: #f5f7fa; }}
+    .nav-row {{ display: flex; gap: 0.5rem; margin-bottom: 0.6rem; }}
+    .nav-row .btn {{ margin-bottom: 0; }}
+    .btn-nav {{ background: #fff; color: #1a1a1a; border-color: #bbc0c7; }}
+    .btn-nav:hover:not(:disabled) {{ background: #f5f7fa; }}
+    hr.divider {{ border: none; border-top: 1px solid #d8dde4; margin: 0.75rem 0; }}
+    .metric {{ margin-bottom: 0.75rem; }}
+    .metric-label {{ font-size: 0.75rem; color: #666; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.15rem; }}
+    .metric-value {{ font-size: 1.5rem; font-weight: 700; }}
+    .completion-box {{
+      background: #e6f4ea;
+      border: 1px solid #a8d5b5;
+      border-radius: 8px;
+      padding: 1rem;
+      margin-bottom: 1rem;
     }}
-    .btn-yes {{
-      background: #1a73e8;
-      color: #fff;
-      border-color: #1a73e8;
-    }}
-    .btn-yes:hover {{ background: #1558c0; border-color: #1558c0; }}
-    .btn-no {{
-      background: #fff;
-      color: #1a1a1a;
-      border-color: #bbc0c7;
-    }}
-    .btn-no:hover {{ background: #f5f7fa; }}
-    hr.divider {{
-      border: none;
-      border-top: 1px solid #d8dde4;
-      margin: 0.75rem 0;
-    }}
-    .remaining {{ color: #888; font-size: 0.85rem; }}
-    .completion h1 {{ margin-bottom: 1rem; }}
-    .completion p {{ line-height: 1.5; margin-bottom: 0.8rem; color: #444; }}
-    .btn-download {{
-      background: #188038;
-      color: #fff;
-      border-color: #188038;
-      margin-top: 0.5rem;
-    }}
-    .btn-download:hover {{ background: #146c2e; border-color: #146c2e; }}
+    .completion-box h2 {{ color: #1e6e35; margin-bottom: 0.5rem; }}
+    .completion-box p {{ font-size: 0.85rem; color: #2d5a3d; line-height: 1.5; }}
+    .btn-download {{ background: #188038; color: #fff; border-color: #188038; }}
+    .btn-download:hover:not(:disabled) {{ background: #146c2e; border-color: #146c2e; }}
     .error {{ color: #c62828; background: #fce8e6; border-radius: 6px; padding: 1rem; }}
+    @media (max-width: 600px) {{
+      .layout {{ flex-direction: column; }}
+    }}
   </style>
 </head>
 <body>
-  <div id="app"></div>
+  <div class="layout">
+    <div class="col-image"    id="col-image"></div>
+    <div class="col-controls" id="col-controls"></div>
+  </div>
   <script>
     // ---- embedded session data ----
     const SESSION_DATA = {session_json};
@@ -137,6 +143,8 @@ _HTML_TEMPLATE = """\
     const SESSION_ID  = SESSION_DATA.session_id;
     const STORAGE_KEY = "review_labels_" + SESSION_ID;
     const tiles = SESSION_DATA.tiles.slice().sort((a, b) => a.display_index - b.display_index);
+    const total = tiles.length;
+    let currentIndex = 0;
 
     function loadLabels() {{
       try {{ return JSON.parse(localStorage.getItem(STORAGE_KEY) || "{{}}"); }}
@@ -147,6 +155,10 @@ _HTML_TEMPLATE = """\
       localStorage.setItem(STORAGE_KEY, JSON.stringify(labels));
     }}
 
+    function labelledCount(labels) {{
+      return Object.keys(labels).length;
+    }}
+
     function firstUnlabelledIndex(labels) {{
       for (let i = 0; i < tiles.length; i++) {{
         if (!(tiles[i].tile_id in labels)) return i;
@@ -154,26 +166,32 @@ _HTML_TEMPLATE = """\
       return null;
     }}
 
-    function render() {{
-      const labels = loadLabels();
-      const idx    = firstUnlabelledIndex(labels);
-      const app    = document.getElementById("app");
-      if (idx === null) {{ renderCompletion(app, labels); }}
-      else              {{ renderTile(app, tiles[idx], idx, labels); }}
+    function nextUnlabelledIndex(labels, fromIndex) {{
+      for (let offset = 1; offset < tiles.length; offset++) {{
+        const i = (fromIndex + offset) % tiles.length;
+        if (!(tiles[i].tile_id in labels)) return i;
+      }}
+      return null;
     }}
 
-    function renderTile(app, tile, idx, labels) {{
-      const total    = tiles.length;
-      const labelled = Object.keys(labels).length;
-      const pct      = (idx / total * 100).toFixed(1);
-      const imgSrc   = TILE_IMAGES[tile.png_filename];
+    function clampIndex(idx) {{
+      return Math.min(Math.max(idx, 0), total - 1);
+    }}
+
+    function renderImage(idx) {{
+      const tile    = tiles[idx];
+      const labels  = loadLabels();
+      const labelled = labelledCount(labels);
+      const pct     = (labelled / total * 100).toFixed(1);
+      const imgSrc  = TILE_IMAGES[tile.png_filename];
+      const col     = document.getElementById("col-image");
 
       if (!imgSrc) {{
-        app.innerHTML = `<p class="error">Image not found: ${{tile.png_filename}}</p>`;
+        col.innerHTML = `<p class="error">Image not found: ${{tile.png_filename}}</p>`;
         return;
       }}
 
-      app.innerHTML = `
+      col.innerHTML = `
         <h1>Coral Oocyte Review</h1>
         <p class="caption">Tile ${{idx + 1}} of ${{total}}</p>
         <div class="progress-wrap">
@@ -183,14 +201,80 @@ _HTML_TEMPLATE = """\
           <img src="${{imgSrc}}" alt="Tile ${{idx + 1}}">
         </div>
         <p class="scale-caption">Scale: ${{tile.tile_size}}&thinsp;px</p>
+      `;
+    }}
+
+    function renderControls(idx) {{
+      const tile    = tiles[idx];
+      const labels  = loadLabels();
+      const labelled = labelledCount(labels);
+      const remaining = total - labelled;
+      const entry   = labels[tile.tile_id];
+      const col     = document.getElementById("col-controls");
+
+      let statusHtml;
+      if (entry === undefined) {{
+        statusHtml = `<div class="status status-unlabelled">Current answer: Not labelled</div>`;
+      }} else if (entry.label === true) {{
+        statusHtml = `<div class="status status-yes">Current answer: Yes</div>`;
+      }} else {{
+        statusHtml = `<div class="status status-no">Current answer: No</div>`;
+      }}
+
+      const prevDisabled = idx === 0         ? "disabled" : "";
+      const nextDisabled = idx === total - 1 ? "disabled" : "";
+
+      let completionHtml = "";
+      if (remaining === 0) {{
+        completionHtml = `
+          <div class="completion-box">
+            <h2>Review complete</h2>
+            <p>${{total}} / ${{total}} tiles labelled.<br>
+               Click below to download your results, then send the
+               <strong>session.json</strong> file back to the study coordinator.</p>
+          </div>
+          <button class="btn btn-download" id="btn-download">Download session.json</button>
+        `;
+      }}
+
+      col.innerHTML = `
+        <h2>Answer</h2>
+        ${{statusHtml}}
         <button class="btn btn-yes" id="btn-yes">Yes — I see an oocyte</button>
         <button class="btn btn-no"  id="btn-no">No — no oocyte here</button>
+        <div class="nav-row">
+          <button class="btn btn-nav" id="btn-prev" ${{prevDisabled}}>Prev</button>
+          <button class="btn btn-nav" id="btn-next" ${{nextDisabled}}>Next</button>
+        </div>
         <hr class="divider">
-        <p class="remaining">Remaining: ${{total - labelled}}</p>
+        <div class="metric">
+          <div class="metric-label">Labelled</div>
+          <div class="metric-value">${{labelled}} / ${{total}}</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Remaining</div>
+          <div class="metric-value">${{remaining}}</div>
+        </div>
+        ${{completionHtml}}
       `;
 
       document.getElementById("btn-yes").addEventListener("click", () => recordLabel(tile.tile_id, true));
       document.getElementById("btn-no").addEventListener("click",  () => recordLabel(tile.tile_id, false));
+      document.getElementById("btn-prev").addEventListener("click", () => moveTo(idx - 1));
+      document.getElementById("btn-next").addEventListener("click", () => moveTo(idx + 1));
+      if (remaining === 0) {{
+        document.getElementById("btn-download").addEventListener("click", downloadResults);
+      }}
+    }}
+
+    function render() {{
+      renderImage(currentIndex);
+      renderControls(currentIndex);
+    }}
+
+    function moveTo(idx) {{
+      currentIndex = clampIndex(idx);
+      render();
     }}
 
     function recordLabel(tileId, label) {{
@@ -198,26 +282,13 @@ _HTML_TEMPLATE = """\
       const now    = new Date().toISOString().slice(0, 19);
       labels[tileId] = {{ label, labelled_at: now }};
       saveLabels(labels);
+      const next = nextUnlabelledIndex(labels, currentIndex);
+      currentIndex = next !== null ? next : clampIndex(currentIndex);
       render();
     }}
 
-    function renderCompletion(app, labels) {{
-      const total = tiles.length;
-      app.innerHTML = `
-        <div class="completion">
-          <h1>Review complete</h1>
-          <p>${{total}} / ${{total}} tiles labelled.</p>
-          <p>Click the button below to download your results, then send the
-             <strong>session.json</strong> file back to the study coordinator.</p>
-          <button class="btn btn-download" id="btn-download">
-            Download session.json
-          </button>
-        </div>
-      `;
-      document.getElementById("btn-download").addEventListener("click", () => downloadResults(labels));
-    }}
-
-    function downloadResults(labels) {{
+    function downloadResults() {{
+      const labels  = loadLabels();
       const updated = JSON.parse(JSON.stringify(SESSION_DATA));
       for (const tile of updated.tiles) {{
         const entry = labels[tile.tile_id];
@@ -236,6 +307,9 @@ _HTML_TEMPLATE = """\
       URL.revokeObjectURL(url);
     }}
 
+    // start at the first unlabelled tile
+    const _init = firstUnlabelledIndex(loadLabels());
+    currentIndex = _init !== null ? _init : 0;
     render();
   </script>
 </body>
@@ -249,20 +323,36 @@ def build_review_html(session_dir: Path) -> Path:
     Parameters
     ----------
     session_dir:
-        Path to the prepared review session directory containing
-        ``session.json`` and a ``tiles/`` sub-folder.
+        Path to the prepared review session directory containing either
+        ``session_meta.json`` + ``labels.json`` (current format) or the
+        legacy ``session.json``, plus a ``tiles/`` sub-folder.
 
     Returns
     -------
     Path
         Path to the written ``review.html`` file (inside *session_dir*).
     """
-    session_path = session_dir / "session.json"
-    if not session_path.exists():
-        raise FileNotFoundError(f"Session manifest not found: {session_path}")
+    meta_path   = session_dir / "session_meta.json"
+    labels_path = session_dir / "labels.json"
+    legacy_path = session_dir / "session.json"
 
-    with session_path.open("r", encoding="utf-8") as fp:
-        session_data = json.load(fp)
+    if meta_path.exists() and labels_path.exists():
+        with meta_path.open("r", encoding="utf-8") as fp:
+            session_data = json.load(fp)
+        with labels_path.open("r", encoding="utf-8") as fp:
+            labels_data = json.load(fp)
+        labels_by_id = {row["tile_id"]: row for row in labels_data.get("labels", [])}
+        for tile in session_data.get("tiles", []):
+            row = labels_by_id.get(tile["tile_id"], {})
+            tile["collaborator_label"] = row.get("collaborator_label")
+            tile["labelled_at"] = row.get("labelled_at")
+    elif legacy_path.exists():
+        with legacy_path.open("r", encoding="utf-8") as fp:
+            session_data = json.load(fp)
+    else:
+        raise FileNotFoundError(
+            f"Session files not found in {session_dir}: expected session_meta.json + labels.json"
+        )
 
     tile_images: dict[str, str] = {}
     for tile in session_data["tiles"]:
