@@ -25,6 +25,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "nbstripout>=0.9.1",
     "pytest>=8.0",
     "pytest-cov>=6.0",
 ]
