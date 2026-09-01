@@ -21,6 +21,7 @@ from __future__ import annotations
 import re
 
 STAGE_PATTERN = re.compile(r"stage\s*(\d+)", re.IGNORECASE)
+FEATURE_COLLECTION = "FeatureCollection"
 
 
 def extract_stage(props: dict) -> int | None:

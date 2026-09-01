@@ -14,7 +14,9 @@ import pytest
 
 from src.data_preparation.generate_split_manifest import (
     assign_splits,
+    build_split_manifest,
     compute_stage_distribution,
+    write_split_manifest,
 )
 
 
@@ -124,6 +126,26 @@ def test_assign_splits_missing_stratum_quota_raises():
         assign_splits(dist, quotas={}, seed=42)
 
 
+def test_assign_splits_quota_exceeds_stratum_size_raises():
+    dist = {
+        "CHN_A_1_1-2": {"location": "CHN", "stage_counts": {0: 5}},
+        "CHN_A_2_1-2": {"location": "CHN", "stage_counts": {0: 5}},
+    }
+    quotas = {("CHN", False): (2, 1)}  # 3 requested, only 2 slides available
+    with pytest.raises(ValueError):
+        assign_splits(dist, quotas=quotas, seed=42)
+
+
+def test_assign_splits_negative_quota_raises():
+    dist = {
+        "CHN_A_1_1-2": {"location": "CHN", "stage_counts": {0: 5}},
+        "CHN_A_2_1-2": {"location": "CHN", "stage_counts": {0: 5}},
+    }
+    quotas = {("CHN", False): (1, -1)}
+    with pytest.raises(ValueError):
+        assign_splits(dist, quotas=quotas, seed=42)
+
+
 def test_assign_splits_real_corpus_golden():
     dist = compute_stage_distribution(REPO_ROOT / "data" / "dataset_28_04")
     result = assign_splits(dist, seed=42)
@@ -145,3 +167,43 @@ def test_assign_splits_real_corpus_golden():
     assert actual_train == expected_train
     assert actual_val == expected_val
     assert actual_test == expected_test
+
+
+def test_build_split_manifest_schema(tmp_path: Path):
+    for i in range(4):
+        _write_geojson(tmp_path / f"CHN_A_{i}_1-2.geojson", ["Oosorption Stage 0"])
+    quotas = {("CHN", False): (1, 1)}
+
+    manifest = build_split_manifest(tmp_path, quotas=quotas, seed=42)
+
+    for key in (
+        "manifest_version", "created", "seed", "force_train_if_stage_present",
+        "quotas", "n_slides", "split_counts", "slides",
+    ):
+        assert key in manifest
+    assert manifest["n_slides"] == 4
+    assert sum(manifest["split_counts"].values()) == manifest["n_slides"]
+    assert set(manifest["slides"].keys()) == {f"CHN_A_{i}_1-2" for i in range(4)}
+
+
+def test_write_split_manifest_roundtrip(tmp_path: Path):
+    # stage_counts keys are int in memory but always come back as str from json.load
+    # (JSON object keys are always strings) - use str keys here so the test is only
+    # exercising the write/read roundtrip and indentation, not that key-type contract.
+    manifest = {
+        "manifest_version": "v1",
+        "n_slides": 2,
+        "split_counts": {"train": 1, "val": 1, "test": 0},
+        "slides": {"A_1_1-2": {"split": "train", "location": "A", "stage_counts": {"0": 1}}},
+    }
+    output_path = tmp_path / "split_manifest.json"
+
+    write_split_manifest(manifest, output_path)
+
+    with output_path.open("r", encoding="utf-8") as fp:
+        reloaded = json.load(fp)
+    assert reloaded == manifest
+
+    lines = output_path.read_text(encoding="utf-8").splitlines()
+    depth_1_lines = [line for line in lines if line.startswith('  "')]
+    assert depth_1_lines, "expected at least one depth-1 key line"

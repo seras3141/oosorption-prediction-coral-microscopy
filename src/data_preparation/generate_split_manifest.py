@@ -10,13 +10,13 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import date
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from src.data_preparation.annotations import extract_stage
-from src.data_preparation.remap_annotations import FEATURE_COLLECTION
+from src.data_preparation.annotations import FEATURE_COLLECTION, extract_stage
 
 LOG = logging.getLogger(__name__)
 
@@ -136,7 +136,10 @@ def assign_splits(
         stratum members go to train. Must cover every stratum present in
         ``stage_distribution`` after the force-train step, or a
         ``KeyError`` is raised (fail loudly rather than silently
-        defaulting an unplanned-for stratum).
+        defaulting an unplanned-for stratum). Both values must be
+        non-negative and their sum must not exceed the stratum's size, or
+        a ``ValueError`` is raised (fail loudly rather than silently
+        under-filling a split or overwriting an earlier assignment).
     force_train_if_stage_present : tuple of int, optional
         Any slide containing an annotation whose stage is in this tuple
         is force-assigned to train before stratification.
@@ -176,16 +179,137 @@ def assign_splits(
 
     rng = np.random.default_rng(seed)
     for key in sorted(strata.keys()):
-        n_val, n_test = quotas[key]
+        try:
+            n_val, n_test = quotas[key]
+        except KeyError:
+            raise KeyError(
+                f"No quota defined for stratum {key} "
+                f"({len(strata[key])} slide(s): {sorted(strata[key])})"
+            ) from None
+        if n_val < 0 or n_test < 0:
+            raise ValueError(f"Quota for stratum {key} must be non-negative, got {(n_val, n_test)}")
+        n_train_start = n_val + n_test
+        if n_train_start > len(strata[key]):
+            raise ValueError(
+                f"Stratum {key} has only {len(strata[key])} slide(s), which cannot cover "
+                f"quota (n_val={n_val}, n_test={n_test})"
+            )
         shuffled = sorted(strata[key])
         rng.shuffle(shuffled)
         for stem in shuffled[:n_val]:
             result[stem] = "val"
-        for stem in shuffled[n_val:n_val + n_test]:
+        for stem in shuffled[n_val:n_train_start]:
             result[stem] = "test"
-        for stem in shuffled[n_val + n_test:]:
+        for stem in shuffled[n_train_start:]:
             result[stem] = "train"
 
     if set(result.keys()) != set(stage_distribution.keys()):
         raise AssertionError("every slide must be assigned exactly once")
     return result
+
+
+def _quota_key(location: str, has_stratify_stage: bool) -> str:
+    return f"{location}_{'has_stage2' if has_stratify_stage else 'no_stage2'}"
+
+
+def build_split_manifest(
+    geojson_dir: str | Path,
+    *,
+    quotas: dict[tuple[str, bool], tuple[int, int]] = DEFAULT_QUOTAS,
+    seed: int = DEFAULT_SEED,
+) -> dict[str, Any]:
+    """Compute distribution + assignment and assemble the manifest dict
+    documented in plan_addendum_m6_split.md §6.
+
+    Parameters
+    ----------
+    geojson_dir : str or Path
+        Passed through to ``compute_stage_distribution``.
+    quotas : dict, optional
+        Passed through to ``assign_splits``.
+    seed : int, optional
+        Passed through to ``assign_splits``; also recorded in the
+        returned manifest's ``"seed"`` field.
+
+    Returns
+    -------
+    dict
+        Ready to pass to ``write_split_manifest``.
+
+    Examples
+    --------
+    >>> import json, tempfile
+    >>> with tempfile.TemporaryDirectory() as tmp:
+    ...     fc = {"type": "FeatureCollection",
+    ...           "features": [{"properties": {"name": "Oosorption Stage 0"}}]}
+    ...     _ = (Path(tmp) / "A_1_1-2.geojson").write_text(json.dumps(fc))
+    ...     _ = (Path(tmp) / "A_2_1-2.geojson").write_text(json.dumps(fc))
+    ...     manifest = build_split_manifest(tmp, quotas={("A", False): (0, 1)}, seed=0)
+    >>> manifest["n_slides"]
+    2
+    >>> sum(manifest["split_counts"].values()) == manifest["n_slides"]
+    True
+    """
+    distribution = compute_stage_distribution(geojson_dir)
+    assignment = assign_splits(distribution, quotas=quotas, seed=seed)
+
+    split_counts = {"train": 0, "val": 0, "test": 0}
+    slides: dict[str, Any] = {}
+    for stem, info in distribution.items():
+        split = assignment[stem]
+        split_counts[split] += 1
+        slides[stem] = {
+            "split": split,
+            "location": info["location"],
+            "stage_counts": info["stage_counts"],
+        }
+
+    quotas_out = {
+        _quota_key(location, has_stage2): [n_val, n_test]
+        for (location, has_stage2), (n_val, n_test) in quotas.items()
+    }
+
+    return {
+        "manifest_version": MANIFEST_VERSION,
+        "created": date.today().isoformat(),
+        "seed": seed,
+        "force_train_if_stage_present": list(FORCE_TRAIN_IF_STAGE_PRESENT),
+        "quotas": quotas_out,
+        "n_slides": len(distribution),
+        "split_counts": split_counts,
+        "slides": slides,
+    }
+
+
+def write_split_manifest(manifest: dict[str, Any], output_path: str | Path) -> Path:
+    """Write *manifest* as JSON, 2-space indent, snake_case keys.
+
+    Parameters
+    ----------
+    manifest : dict
+        Output of ``build_split_manifest``.
+    output_path : str or Path
+        Typically ``data/splits/split_manifest.json``. Parent directory
+        is created if absent.
+
+    Returns
+    -------
+    Path
+        The path written to.
+
+    Examples
+    --------
+    >>> import tempfile
+    >>> manifest = {"n_slides": 2, "split_counts": {"train": 1, "val": 1, "test": 0}}
+    >>> with tempfile.TemporaryDirectory() as tmp:
+    ...     out = write_split_manifest(manifest, Path(tmp) / "sub" / "split_manifest.json")
+    ...     reloaded = json.loads(out.read_text())
+    >>> reloaded == manifest
+    True
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as fp:
+        json.dump(manifest, fp, indent=2)
+        fp.write("\n")
+    return output_path
