@@ -1,9 +1,8 @@
 """Deterministic slide-level train/val/test split manifest generation.
 
-Implements the algorithm specified in ``docs_local/plan_addendum_m6_split.md``
-so every downstream training step (M7 YOLOv8-seg, the tile-classification
-baseline, M10 stage classifier) reads splits from one file instead of
-re-deriving its own ad hoc split.
+This module generates a reproducible, slide-level train/val/test split manifest so
+every downstream training step reads splits from one file instead of re-deriving
+its own ad hoc split.
 """
 
 from __future__ import annotations
