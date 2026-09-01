@@ -12,19 +12,19 @@ if str(REPO_ROOT) not in sys.path:
 from src.data_preparation.annotations import extract_stage
 
 
-def test_extract_stage_from_name():
+def test_extract_stage_from_name() -> None:
     assert extract_stage({"name": "Oosorption Stage 0"}) == 0
 
 
-def test_extract_stage_no_matching_field():
+def test_extract_stage_no_matching_field() -> None:
     assert extract_stage({"foo": "bar"}) is None
 
 
-def test_extract_stage_from_classification_name():
+def test_extract_stage_from_classification_name() -> None:
     assert extract_stage({"classification": {"name": "Stage 3"}}) == 3
 
 
-def test_extract_stage_metadata_takes_priority_over_name():
+def test_extract_stage_metadata_takes_priority_over_name() -> None:
     # Regression case from the real conflicting feature in
     # data/dataset_28_04/CHN_SP_5_13-15.geojson: metadata.ANNOTATION_DESCRIPTION
     # must win over `name` when both are present and disagree.

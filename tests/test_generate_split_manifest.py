@@ -34,7 +34,7 @@ def _write_geojson(path: Path, feature_names: list[str]) -> None:
         json.dump(fc, fp)
 
 
-def test_compute_stage_distribution_synthetic(tmp_path: Path):
+def test_compute_stage_distribution_synthetic(tmp_path: Path) -> None:
     _write_geojson(tmp_path / "LHP_W_1_1-2.geojson", ["Oosorption Stage 1", "Oosorption Stage 0"])
     _write_geojson(tmp_path / "CHN_AU_2_3-4.geojson", ["Oosorption Stage 0", "Oosorption Stage 0"])
     _write_geojson(
@@ -54,7 +54,7 @@ def test_compute_stage_distribution_synthetic(tmp_path: Path):
     assert dist["LHP_SU_3_5-6"]["stage_counts"] == {0: 1, 2: 1, 3: 1}
 
 
-def test_compute_stage_distribution_skips_unlabelled(tmp_path: Path):
+def test_compute_stage_distribution_skips_unlabelled(tmp_path: Path) -> None:
     _write_geojson(
         tmp_path / "CHN_AU_1_1-2.geojson",
         ["Oosorption Stage 0", "no stage information here"],
@@ -65,7 +65,9 @@ def test_compute_stage_distribution_skips_unlabelled(tmp_path: Path):
     assert dist["CHN_AU_1_1-2"]["stage_counts"] == {0: 1}
 
 
-def test_compute_stage_distribution_skips_out_of_range_stage(tmp_path: Path, caplog):
+def test_compute_stage_distribution_skips_out_of_range_stage(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     _write_geojson(
         tmp_path / "CHN_AU_1_1-2.geojson",
         ["Oosorption Stage 0", "Oosorption Stage 12"],
@@ -78,7 +80,7 @@ def test_compute_stage_distribution_skips_out_of_range_stage(tmp_path: Path, cap
     assert any("outside the valid 0-4 range" in rec.message for rec in caplog.records)
 
 
-def test_assign_splits_forces_scarce_stage_to_train():
+def test_assign_splits_forces_scarce_stage_to_train() -> None:
     dist = {
         "LHP_A_1_1-2": {"location": "LHP", "stage_counts": {1: 1, 0: 5}},
         "LHP_A_2_1-2": {"location": "LHP", "stage_counts": {0: 5}},
@@ -91,7 +93,7 @@ def test_assign_splits_forces_scarce_stage_to_train():
         assert result["LHP_A_1_1-2"] == "train"
 
 
-def test_assign_splits_quota_exact():
+def test_assign_splits_quota_exact() -> None:
     dist = {
         f"CHN_A_{i}_1-2": {"location": "CHN", "stage_counts": {0: 1}} for i in range(4)
     }
@@ -105,7 +107,7 @@ def test_assign_splits_quota_exact():
     assert counts == {"train": 2, "val": 1, "test": 1}
 
 
-def test_assign_splits_deterministic():
+def test_assign_splits_deterministic() -> None:
     dist = {
         f"LHP_A_{i}_1-2": {"location": "LHP", "stage_counts": {0: 1, 2: i % 2}}
         for i in range(6)
@@ -118,7 +120,7 @@ def test_assign_splits_deterministic():
     assert result_a == result_b
 
 
-def test_assign_splits_missing_stratum_quota_raises():
+def test_assign_splits_missing_stratum_quota_raises() -> None:
     dist = {
         "LHP_A_1_1-2": {"location": "LHP", "stage_counts": {0: 5}},
     }
@@ -126,7 +128,7 @@ def test_assign_splits_missing_stratum_quota_raises():
         assign_splits(dist, quotas={}, seed=42)
 
 
-def test_assign_splits_quota_exceeds_stratum_size_raises():
+def test_assign_splits_quota_exceeds_stratum_size_raises() -> None:
     dist = {
         "CHN_A_1_1-2": {"location": "CHN", "stage_counts": {0: 5}},
         "CHN_A_2_1-2": {"location": "CHN", "stage_counts": {0: 5}},
@@ -136,7 +138,7 @@ def test_assign_splits_quota_exceeds_stratum_size_raises():
         assign_splits(dist, quotas=quotas, seed=42)
 
 
-def test_assign_splits_negative_quota_raises():
+def test_assign_splits_negative_quota_raises() -> None:
     dist = {
         "CHN_A_1_1-2": {"location": "CHN", "stage_counts": {0: 5}},
         "CHN_A_2_1-2": {"location": "CHN", "stage_counts": {0: 5}},
@@ -146,7 +148,7 @@ def test_assign_splits_negative_quota_raises():
         assign_splits(dist, quotas=quotas, seed=42)
 
 
-def test_assign_splits_real_corpus_golden():
+def test_assign_splits_real_corpus_golden() -> None:
     dist = compute_stage_distribution(REPO_ROOT / "data" / "dataset_28_04")
     result = assign_splits(dist, seed=42)
 
@@ -169,7 +171,7 @@ def test_assign_splits_real_corpus_golden():
     assert actual_test == expected_test
 
 
-def test_build_split_manifest_schema(tmp_path: Path):
+def test_build_split_manifest_schema(tmp_path: Path) -> None:
     for i in range(4):
         _write_geojson(tmp_path / f"CHN_A_{i}_1-2.geojson", ["Oosorption Stage 0"])
     quotas = {("CHN", False): (1, 1)}
@@ -186,7 +188,7 @@ def test_build_split_manifest_schema(tmp_path: Path):
     assert set(manifest["slides"].keys()) == {f"CHN_A_{i}_1-2" for i in range(4)}
 
 
-def test_write_split_manifest_roundtrip(tmp_path: Path):
+def test_write_split_manifest_roundtrip(tmp_path: Path) -> None:
     # stage_counts keys are int in memory but always come back as str from json.load
     # (JSON object keys are always strings) - use str keys here so the test is only
     # exercising the write/read roundtrip and indentation, not that key-type contract.

@@ -209,7 +209,8 @@ def assign_splits(
 
 
 def _quota_key(location: str, has_stratify_stage: bool) -> str:
-    return f"{location}_{'has_stage2' if has_stratify_stage else 'no_stage2'}"
+    prefix = "has" if has_stratify_stage else "no"
+    return f"{location}_{prefix}_stage{STRATIFY_ON_STAGE}"
 
 
 def build_split_manifest(
@@ -261,7 +262,7 @@ def build_split_manifest(
         slides[stem] = {
             "split": split,
             "location": info["location"],
-            "stage_counts": info["stage_counts"],
+            "stage_counts": dict(info["stage_counts"]),
         }
 
     quotas_out = {
