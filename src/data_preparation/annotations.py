@@ -14,6 +14,14 @@ different contract from this module's ``extract_stage`` (properties-only
 input, ``int | None`` output, three-field fallback). That is pre-existing
 duplication elsewhere in the codebase and is out of scope here; the two are
 not the same helper and should not be merged.
+
+A third copy, with the *same* contract as this module's ``extract_stage``
+(properties-only input, identical priority order and regex), also predates
+this module in ``notebooks/oocyte_data_analysis.ipynb``. It was left as-is
+when this module was created - notebooks in this project are conventionally
+self-contained rather than importing from ``src`` - but it is the one
+pre-existing duplicate that a future refactor could actually replace with an
+import of this function, unlike the two ``_extract_stage`` helpers above.
 """
 
 from __future__ import annotations

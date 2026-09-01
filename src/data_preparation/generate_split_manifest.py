@@ -110,7 +110,15 @@ def compute_stage_distribution(
 
 
 def _has_stage(stage_counts: dict[int, int], stage: int) -> bool:
-    """Return True if stage_counts[stage] > 0 (missing key treated as 0)."""
+    """Return True if stage_counts[stage] > 0 (missing key treated as 0).
+
+    Examples
+    --------
+    >>> _has_stage({0: 5, 2: 1}, 2)
+    True
+    >>> _has_stage({0: 5}, 2)
+    False
+    """
     return stage_counts.get(stage, 0) > 0
 
 
@@ -209,6 +217,15 @@ def assign_splits(
 
 
 def _quota_key(location: str, has_stratify_stage: bool) -> str:
+    """Build the manifest's flat ``quotas`` schema key for a (location, has_stage) stratum.
+
+    Examples
+    --------
+    >>> _quota_key("CHN", True)
+    'CHN_has_stage2'
+    >>> _quota_key("CHN", False)
+    'CHN_no_stage2'
+    """
     prefix = "has" if has_stratify_stage else "no"
     return f"{location}_{prefix}_stage{STRATIFY_ON_STAGE}"
 
@@ -314,3 +331,53 @@ def write_split_manifest(manifest: dict[str, Any], output_path: str | Path) -> P
         json.dump(manifest, fp, indent=2)
         fp.write("\n")
     return output_path
+
+
+def format_split_summary(manifest: dict[str, Any]) -> str:
+    """Render the per-split location/stage tally table documented in §7.2.
+
+    Works on both an in-memory manifest (``stage_counts`` int keys) and one
+    freshly loaded via ``json.load`` (str keys) - see the key-type contract
+    on ``stage_counts`` in the module docstring.
+
+    Parameters
+    ----------
+    manifest : dict
+        Output of ``build_split_manifest``, or the equivalent reloaded from
+        a written ``split_manifest.json``.
+
+    Returns
+    -------
+    str
+        The table, one line per split plus a header, no trailing newline.
+
+    Examples
+    --------
+    >>> manifest = {"slides": {
+    ...     "CHN_A_1_1-2": {"split": "train", "location": "CHN", "stage_counts": {"0": 5}},
+    ... }}
+    >>> print(format_split_summary(manifest))
+    split   n_slides   CHN   LHP  stage0  stage1  stage2  stage3  stage4
+    train          1     1     0       5       0       0       0       0
+    val            0     0     0       0       0       0       0       0
+    test           0     0     0       0       0       0       0       0
+    """
+    stages = tuple(sorted(VALID_STAGES))
+    lines = [
+        f"{'split':<7} {'n_slides':>8} {'CHN':>5} {'LHP':>5} "
+        + " ".join(f"{'stage' + str(s):>7}" for s in stages)
+    ]
+    for split in ("train", "val", "test"):
+        slides = [s for s in manifest["slides"].values() if s["split"] == split]
+        n_slides = len(slides)
+        n_chn = sum(1 for s in slides if s["location"] == "CHN")
+        n_lhp = sum(1 for s in slides if s["location"] == "LHP")
+        stage_totals = {stage: 0 for stage in stages}
+        for s in slides:
+            for stage, count in s["stage_counts"].items():
+                stage_totals[int(stage)] += count
+        lines.append(
+            f"{split:<7} {n_slides:>8} {n_chn:>5} {n_lhp:>5} "
+            + " ".join(f"{stage_totals[s]:>7}" for s in stages)
+        )
+    return "\n".join(lines)

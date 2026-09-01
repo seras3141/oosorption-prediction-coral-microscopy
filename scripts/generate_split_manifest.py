@@ -7,7 +7,6 @@ import argparse
 import logging
 import sys
 from pathlib import Path
-from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -15,8 +14,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.data_preparation.generate_split_manifest import (
     DEFAULT_SEED,
-    VALID_STAGES,
     build_split_manifest,
+    format_split_summary,
     write_split_manifest,
 )
 
@@ -24,8 +23,6 @@ LOG_FORMAT = "[%(levelname)s] %(message)s"
 DEFAULT_GEOJSON_DIR = Path("data/dataset_28_04")
 DEFAULT_OUTPUT = Path("data/splits/split_manifest.json")
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING")
-SPLITS = ("train", "val", "test")
-STAGES = tuple(sorted(VALID_STAGES))
 
 
 def parse_args() -> argparse.Namespace:
@@ -70,36 +67,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _print_summary(manifest: dict[str, Any]) -> None:
-    header = (
-        f"{'split':<7} {'n_slides':>8} {'CHN':>5} {'LHP':>5} "
-        + " ".join(f"{'stage' + str(s):>7}" for s in STAGES)
-    )
-    print(header)
-    for split in SPLITS:
-        slides = [s for s in manifest["slides"].values() if s["split"] == split]
-        n_slides = len(slides)
-        n_chn = sum(1 for s in slides if s["location"] == "CHN")
-        n_lhp = sum(1 for s in slides if s["location"] == "LHP")
-        stage_totals = {stage: 0 for stage in STAGES}
-        for s in slides:
-            for stage, count in s["stage_counts"].items():
-                # stage_counts keys are int in-memory, str once JSON-round-tripped.
-                stage_totals[int(stage)] += count
-        row = (
-            f"{split:<7} {n_slides:>8} {n_chn:>5} {n_lhp:>5} "
-            + " ".join(f"{stage_totals[s]:>7}" for s in STAGES)
-        )
-        print(row)
-
-
 def main() -> int:
     """Run the split manifest generation CLI."""
     args = parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level), format=LOG_FORMAT)
 
     manifest = build_split_manifest(args.geojson_dir, seed=args.seed)
-    _print_summary(manifest)
+    print(format_split_summary(manifest))
 
     if args.dry_run:
         return 0
