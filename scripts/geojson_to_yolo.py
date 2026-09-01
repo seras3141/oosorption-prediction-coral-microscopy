@@ -72,7 +72,6 @@ import argparse
 import csv
 import json
 import logging
-import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -87,6 +86,12 @@ from shapely.geometry import (
     shape as shapely_shape,
 )
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from src.data_preparation.annotations import extract_stage
+
 try:
     import openslide  # type: ignore
 except Exception:  # pragma: no cover - openslide is optional
@@ -99,8 +104,6 @@ except Exception:  # pragma: no cover - PIL is optional, only for tile export
 
 
 LOG = logging.getLogger("geojson_to_yolo")
-
-STAGE_PATTERN = re.compile(r"stage\s*(\d+)", re.IGNORECASE)
 
 # Class index -> human-readable name.  Stage 0 -> 0 ... Stage 4 -> 4.
 DEFAULT_CLASSES = ["Stage_0", "Stage_1", "Stage_2", "Stage_3", "Stage_4"]
@@ -123,28 +126,6 @@ class Instance:
     @property
     def bbox(self) -> tuple[float, float, float, float]:
         return self.polygon.bounds  # (minx, miny, maxx, maxy)
-
-
-def extract_stage(props: dict) -> int | None:
-    """Pull a stage number (0-4) out of a QuPath-style properties block."""
-    candidates: list[str] = []
-    meta = props.get("metadata")
-    if isinstance(meta, dict):
-        desc = meta.get("ANNOTATION_DESCRIPTION")
-        if desc:
-            candidates.append(str(desc))
-    name = props.get("name")
-    if name:
-        candidates.append(str(name))
-    cls = props.get("classification")
-    if isinstance(cls, dict) and cls.get("name"):
-        candidates.append(str(cls["name"]))
-
-    for text in candidates:
-        m = STAGE_PATTERN.search(text)
-        if m:
-            return int(m.group(1))
-    return None
 
 
 def feature_to_polygon(feat: dict) -> Polygon | MultiPolygon | None:
