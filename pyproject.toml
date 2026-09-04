@@ -52,6 +52,7 @@ coral-generate-tiles = "scripts.generate_tiles:main"
 coral-geojson-to-yolo = "scripts.geojson_to_yolo:main"
 coral-extract-rois = "scripts.extract_ndpi_rois:main"
 coral-download-geojson = "scripts.download_geojson:main"
+coral-verify-tile-labels = "scripts.verify_tile_labels:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/data_preparation", "src/modeling", "scripts"]
