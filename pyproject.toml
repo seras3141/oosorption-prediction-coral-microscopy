@@ -54,4 +54,4 @@ coral-extract-rois = "scripts.extract_ndpi_rois:main"
 coral-download-geojson = "scripts.download_geojson:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/data_preparation", "scripts"]
+packages = ["src/data_preparation", "src/modeling", "scripts"]
