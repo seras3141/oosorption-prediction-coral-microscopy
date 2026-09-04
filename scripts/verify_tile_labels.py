@@ -27,7 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.modeling.tile_labels import compute_oocyte_area_fractions
+from src.modeling.tile_labels import _resolve_repo_path, compute_oocyte_area_fractions
 
 # Pinned 2026-09-04 from the full 26-slide corpus, using make_valid to repair the 57% of
 # annotation rings that self-intersect. "centroid" is the manifest flag, kept alongside
@@ -72,19 +72,27 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _count(args: argparse.Namespace) -> dict[tuple[int, str], collections.Counter]:
-    split = json.loads(Path(args.split_manifest).read_text(encoding="utf-8"))["slides"]
+    # Anchor every path the same way tile_labels does, so the script and the module can
+    # never end up reading two different copies of the corpus.
+    tiles_root = _resolve_repo_path(args.tiles_dir)
+    cuts_root = _resolve_repo_path(args.cuts_dir)
+    split_path = _resolve_repo_path(args.split_manifest)
+
+    split = json.loads(split_path.read_text(encoding="utf-8"))["slides"]
     counts: dict[tuple[int, str], collections.Counter] = collections.defaultdict(
         collections.Counter
     )
-    manifests = sorted(glob.glob(f"{args.tiles_dir}/*/*/*_tile_manifest.json"))
+    manifests = sorted(glob.glob(str(tiles_root / "*" / "*" / "*_tile_manifest.json")))
     if not manifests:
-        raise SystemExit(f"No tile manifests found under {args.tiles_dir}")
+        raise SystemExit(f"No tile manifests found under {tiles_root}")
 
     for manifest_path in manifests:
         manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
         stem, cut = manifest["stem"], manifest["cut_name"]
         fractions = compute_oocyte_area_fractions(
-            manifest_path, f"{args.cuts_dir}/{stem}/{cut}_annotations.geojson"
+            manifest_path,
+            cuts_root / stem / f"{cut}_annotations.geojson",
+            tile_sizes=tuple(args.tile_sizes),
         )
         assigned = split[stem]["split"]
         for tile in manifest["tiles"]:
@@ -120,6 +128,14 @@ def main(argv: list[str] | None = None) -> int:
                     f"expected {expected}, got {got}"
                 )
 
+    if not checked:
+        # "All 0 pinned cells match" from the one tool meant to catch silent label
+        # drift would be worse than no tool at all.
+        print(
+            f"No pinned cells cover tile sizes {args.tile_sizes}; "
+            f"pinned sizes are {sorted({size for size, _ in EXPECTED})}."
+        )
+        return 2
     if mismatched:
         print(f"\n{mismatched} of {checked} cells differ from the pinned corpus counts.")
         return 1

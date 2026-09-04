@@ -19,6 +19,7 @@ from src.modeling.tile_labels import (
     compute_oocyte_area_fractions,
     label_for_area_fraction,
     load_annotation_polygons,
+    oocyte_area_fractions_for_manifest,
 )
 
 
@@ -292,3 +293,69 @@ def test_manifest_without_cut_name_raises(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="has no cut_name"):
         compute_oocyte_area_fractions(manifest_path, geojson_path)
+
+
+def test_polygon_with_interior_rings_is_refused(tmp_path: Path) -> None:
+    """The shared ring extractor keeps only ring 0, which would ignore holes."""
+    path = tmp_path / "TEST_cut000_annotations.geojson"
+    _write_json(
+        path,
+        _geojson(
+            [
+                {
+                    "type": "Feature",
+                    "properties": {},
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [
+                            _square(0, 0, 100, 100),
+                            _square(40, 40, 60, 60),
+                        ],
+                    },
+                }
+            ]
+        ),
+    )
+
+    with pytest.raises(ValueError, match="interior ring"):
+        load_annotation_polygons(path)
+
+
+def test_multipolygon_is_refused(tmp_path: Path) -> None:
+    """The extractor keeps only the largest part, which would understate coverage."""
+    path = tmp_path / "TEST_cut000_annotations.geojson"
+    _write_json(
+        path,
+        _geojson(
+            [
+                {
+                    "type": "Feature",
+                    "properties": {},
+                    "geometry": {
+                        "type": "MultiPolygon",
+                        "coordinates": [
+                            [_square(0, 0, 10, 10)],
+                            [_square(50, 50, 90, 90)],
+                        ],
+                    },
+                }
+            ]
+        ),
+    )
+
+    with pytest.raises(ValueError, match="MultiPolygon"):
+        load_annotation_polygons(path)
+
+
+def test_parsed_manifest_entry_point_matches_the_path_one(tmp_path: Path) -> None:
+    """load_tile_index uses the parsed-manifest form to avoid a second 636 MB parse."""
+    tiles = [_tile("a", 0, 0, 100), _tile("b", 500, 500, 100)]
+    features = [_feature(_square(0, 0, 50, 50))]
+    manifest_path, geojson_path = _fixture(tmp_path, tiles, features)
+
+    from_path = compute_oocyte_area_fractions(manifest_path, geojson_path)
+    from_dict = oocyte_area_fractions_for_manifest(
+        json.loads(manifest_path.read_text(encoding="utf-8")), geojson_path
+    )
+
+    assert from_path == from_dict

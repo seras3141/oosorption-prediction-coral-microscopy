@@ -118,6 +118,7 @@ def load_annotation_polygons(annotations_geojson_path: str | Path) -> list[BaseG
 def compute_oocyte_area_fractions(
     tile_manifest_path: str | Path,
     annotations_geojson_path: str | Path,
+    tile_sizes: tuple[int, ...] | None = None,
 ) -> dict[str, float]:
     """Map each tile in a manifest to the fraction of its area covered by oocytes.
 
@@ -133,12 +134,16 @@ def compute_oocyte_area_fractions(
         Path to a ``{cut}_tile_manifest.json``.
     annotations_geojson_path : str or Path
         Path to the matching cut-local annotation GeoJSON.
+    tile_sizes : tuple of int, optional
+        Restrict measurement to these tile sizes. A manifest holds roughly 18x more
+        tiles across all four sizes than at 512 and 1024 alone, and the geometry work
+        is per tile, so passing the sizes actually wanted is worth it on a path that
+        reruns for every training configuration. Defaults to every size present.
 
     Returns
     -------
     dict of str to float
-        ``tile_id`` to covered fraction in ``[0.0, 1.0]``, for every tile in the
-        manifest at every tile size it contains. Callers filter by size.
+        ``tile_id`` to covered fraction in ``[0.0, 1.0]``, one entry per measured tile.
 
     Raises
     ------
@@ -152,12 +157,52 @@ def compute_oocyte_area_fractions(
     0.05
     """
     manifest_path = _resolve_repo_path(tile_manifest_path)
+    return oocyte_area_fractions_for_manifest(
+        _read_json(manifest_path),
+        annotations_geojson_path,
+        tile_sizes=tile_sizes,
+        manifest_path=manifest_path,
+    )
+
+
+def oocyte_area_fractions_for_manifest(
+    manifest: dict[str, Any],
+    annotations_geojson_path: str | Path,
+    tile_sizes: tuple[int, ...] | None = None,
+    manifest_path: Path | None = None,
+) -> dict[str, float]:
+    """Measure coverage from an already-parsed tile manifest.
+
+    Same contract as :func:`compute_oocyte_area_fractions`, which is a thin wrapper over
+    this. Callers that have already read the manifest use this instead: the manifests
+    embed per-tile annotation coordinates and run to hundreds of megabytes in total, so
+    parsing them twice is the dominant cost of building the tile index.
+
+    Parameters
+    ----------
+    manifest : dict
+        Parsed ``{cut}_tile_manifest.json`` content.
+    annotations_geojson_path : str or Path
+        Path to the matching cut-local annotation GeoJSON.
+    tile_sizes : tuple of int, optional
+        Restrict measurement to these tile sizes.
+    manifest_path : Path, optional
+        Only used to make error messages name the offending file.
+
+    Returns
+    -------
+    dict of str to float
+        ``tile_id`` to covered fraction in ``[0.0, 1.0]``, one entry per measured tile.
+    """
     geojson_path = _resolve_repo_path(annotations_geojson_path)
-    manifest = _read_json(manifest_path)
     _check_same_cut(manifest, manifest_path, geojson_path)
     polygons = load_annotation_polygons(geojson_path)
 
-    tiles = manifest.get("tiles", [])
+    tiles = [
+        tile
+        for tile in manifest.get("tiles", [])
+        if tile_sizes is None or tile["tile_size"] in tile_sizes
+    ]
     # Validate every bbox before measuring, so a malformed manifest fails the same way
     # whether or not its cut happens to have annotations.
     tile_boxes = [_tile_box(tile) for tile in tiles]
@@ -228,6 +273,7 @@ def _polygon_from_feature(
 ) -> BaseGeometry | None:
     """Build a valid, positive-area polygonal geometry from one feature, or None."""
     geometry = feature.get("geometry") or {}
+    _reject_lossy_geometry(geometry, path, feature_pos)
     try:
         coords = _extract_ring_coords(geometry)
     except ValueError as exc:
@@ -271,6 +317,36 @@ def _polygon_from_feature(
     return repaired
 
 
+def _reject_lossy_geometry(
+    geometry: dict[str, Any],
+    path: Path,
+    feature_pos: int,
+) -> None:
+    """Refuse geometry whose area the shared ring extractor cannot represent.
+
+    ``_extract_ring_coords`` is reused so that this label and the manifest's centroid
+    label derive from identical geometry, but it keeps only a Polygon's first ring and
+    only a MultiPolygon's largest part. For a centroid that is immaterial; for an area
+    measurement it would over-count holes and under-count multi-part annotations -- a
+    silent understatement of exactly the kind this module exists to prevent. Today's
+    corpus has neither (1,129 LineStrings and 79 single-ring Polygons, no
+    MultiPolygons), so this stops a future QuPath export rather than current data.
+    """
+    geometry_type = geometry.get("type")
+    coordinates = geometry.get("coordinates") or []
+    if geometry_type == "Polygon" and len(coordinates) > 1:
+        raise ValueError(
+            f"{path.name} feature {feature_pos} is a Polygon with "
+            f"{len(coordinates) - 1} interior ring(s); measuring its area would ignore "
+            "the holes and overstate coverage"
+        )
+    if geometry_type == "MultiPolygon":
+        raise ValueError(
+            f"{path.name} feature {feature_pos} is a MultiPolygon; measuring its area "
+            "would keep only the largest part and understate coverage"
+        )
+
+
 def _polygonal_parts(geometry: BaseGeometry) -> BaseGeometry | None:
     """Reduce a repaired geometry to its polygonal content.
 
@@ -288,7 +364,7 @@ def _polygonal_parts(geometry: BaseGeometry) -> BaseGeometry | None:
 
 def _check_same_cut(
     manifest: dict[str, Any],
-    manifest_path: Path,
+    manifest_path: Path | None,
     geojson_path: Path,
 ) -> None:
     """Raise if a manifest is paired with another cut's annotations.
@@ -298,7 +374,7 @@ def _check_same_cut(
     """
     cut_name = manifest.get("cut_name")
     if not cut_name:
-        raise ValueError(f"{manifest_path} has no cut_name")
+        raise ValueError(f"{manifest_path or 'tile manifest'} has no cut_name")
     expected = f"{cut_name}_annotations"
     if geojson_path.stem != expected:
         raise ValueError(
