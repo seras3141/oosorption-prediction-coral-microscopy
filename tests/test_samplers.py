@@ -523,3 +523,17 @@ def test_hard_pool_exactly_large_enough_is_accepted() -> None:
     assert len(pool) >= 15
     for batch in sampler:
         assert len(set(batch)) == len(batch)
+
+
+def test_epoch_length_comes_from_the_hard_pool_when_it_supplies_every_slot() -> None:
+    """With share=1.0 no negative reaches a batch except through the hard pool, so one
+    pass means one pass over that pool. Sizing from all 200 negatives would redraw the
+    same 20 hard tiles for 13 batches and stretch the schedule for nothing."""
+    sampler = _sampler()
+    pool = sampler.set_hard_negatives(
+        [0.5] * len(NEGATIVES), pool_fraction=0.1, share=1.0
+    )
+
+    negatives_per_batch = 20 - sampler.positives_per_batch
+    assert len(sampler) == max(1, len(pool) // negatives_per_batch)
+    assert len(sampler) < len(NEGATIVES) // negatives_per_batch

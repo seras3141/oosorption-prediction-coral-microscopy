@@ -306,3 +306,23 @@ def test_tile_size_matching_no_manifest_raises(tmp_path: Path) -> None:
     the cause."""
     with pytest.raises(ValueError, match=r"No tiles at sizes \[768\]"):
         load_tile_index(**_corpus(tmp_path), tile_sizes=(768,))
+
+
+def test_slide_with_no_tiles_at_the_requested_size_is_not_counted_as_present(
+    tmp_path: Path,
+) -> None:
+    """Otherwise a slide tiled only at other sizes vanishes from the index without
+    tripping the evaluation-shrink guard."""
+    paths = _corpus(tmp_path)
+    # Strip SLIDE_B down to 128 px tiles only, then ask for 512.
+    cut = "SLIDE_B_cut000"
+    manifest_path = paths["tiles_dir"] / "SLIDE_B" / cut / f"{cut}_tile_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["tiles"] = [t for t in manifest["tiles"] if t["tile_size"] == 128]
+    _write_json(manifest_path, manifest)
+
+    with pytest.raises(ValueError, match="SLIDE_B"):
+        load_tile_index(**paths, tile_sizes=(512,))
+
+    index = load_tile_index(**paths, tile_sizes=(512,), allow_missing_slides=True)
+    assert set(index["stem"]) == {"SLIDE_A"}

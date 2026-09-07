@@ -327,10 +327,18 @@ def _reject_lossy_geometry(
     ``_extract_ring_coords`` is reused so that this label and the manifest's centroid
     label derive from identical geometry, but it keeps only a Polygon's first ring and
     only a MultiPolygon's largest part. For a centroid that is immaterial; for an area
-    measurement it would over-count holes and under-count multi-part annotations -- a
-    silent understatement of exactly the kind this module exists to prevent. Today's
-    corpus has neither (1,129 LineStrings and 79 single-ring Polygons, no
-    MultiPolygons), so this stops a future QuPath export rather than current data.
+    measurement it would over-count holes and under-count multi-part annotations.
+
+    This is a backstop, not the real defence, and it does not close the gap on the
+    normal pipeline. ``remap_annotations.py`` reduces each source annotation to a single
+    ring before writing the cut-local GeoJSON this function reads -- a source Polygon or
+    MultiPolygon is re-emitted as a single-ring Polygon -- so holes and extra parts are
+    already gone by the time the file reaches here and this check cannot fire on it. It
+    catches only a GeoJSON that did not come through remapping. Refusing the loss at its
+    source needs a guard in the remapping step; see the risks section of the M7a plan.
+
+    Today's corpus contains neither shape (1,129 LineStrings and 79 single-ring
+    Polygons, no MultiPolygons), so nothing is currently mis-measured either way.
     """
     geometry_type = geometry.get("type")
     coordinates = geometry.get("coordinates") or []

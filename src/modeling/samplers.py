@@ -259,9 +259,13 @@ class ForcedRatioBatchSampler:
             return
         per_batch = self._uniform_per_batch()
         if per_batch <= 0:
-            # share == 1.0: every negative comes from the hard pool, so "cover the
-            # negatives once" no longer means anything. Fall back to the pool itself.
-            per_batch = self._n_negative
+            # The share rounds to every negative slot, so no negative reaches a batch
+            # except through the hard pool. One pass then means one pass over that pool,
+            # not over all negatives: sizing from the full pool would keep drawing the
+            # same few hard tiles for a whole epoch's worth of batches and stretch the
+            # schedule for nothing.
+            self._batches_per_epoch = max(1, len(self._hard_negatives) // self._n_negative)
+            return
         self._batches_per_epoch = max(1, len(self._negatives) // per_batch)
 
     def __len__(self) -> int:

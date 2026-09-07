@@ -123,6 +123,20 @@ def _count(args: argparse.Namespace) -> dict[tuple[int, str], collections.Counte
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+
+    # Check the request before spending the corpus pass on it. Silently dropping an
+    # unpinned size would report a pass over the sizes that happen to be pinned while
+    # the command line says otherwise -- the same vacuous green this tool exists to
+    # avoid, just harder to notice than the all-unpinned case.
+    pinned_sizes = sorted({size for size, _ in EXPECTED})
+    unpinned = [size for size in args.tile_sizes if size not in pinned_sizes]
+    if unpinned:
+        print(
+            f"No pinned cells for tile size(s) {unpinned}; pinned sizes are "
+            f"{pinned_sizes}. Refusing to report a pass over only the pinned subset."
+        )
+        return 2
+
     counts = _count(args)
 
     checked = mismatched = 0
@@ -140,12 +154,9 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
     if not checked:
-        # "All 0 pinned cells match" from the one tool meant to catch silent label
-        # drift would be worse than no tool at all.
-        print(
-            f"No pinned cells cover tile sizes {args.tile_sizes}; "
-            f"pinned sizes are {sorted({size for size, _ in EXPECTED})}."
-        )
+        # Unreachable given the pre-flight check above, but a pass that verified nothing
+        # must never exit 0 from the one tool meant to catch silent label drift.
+        print(f"No pinned cells were checked for tile sizes {args.tile_sizes}.")
         return 2
     if mismatched:
         print(f"\n{mismatched} of {checked} cells differ from the pinned corpus counts.")

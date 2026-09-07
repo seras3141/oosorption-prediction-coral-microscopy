@@ -135,7 +135,6 @@ def load_tile_index(
                 f"manifest; refusing to guess its split"
             )
         assigned = slides[stem]
-        seen_stems.add(stem)
         geojson_path = cuts_root / stem / f"{cut_name}_annotations.geojson"
 
         fractions: dict[str, float] = {}
@@ -153,6 +152,10 @@ def load_tile_index(
         for tile in manifest.get("tiles", []):
             if tile["tile_size"] not in wanted:
                 continue
+            # Marked here rather than per manifest: a slide whose cuts hold none of the
+            # requested sizes contributes no rows, and counting it as present would let
+            # it vanish from the index without tripping the evaluation-shrink guard.
+            seen_stems.add(stem)
             fraction = fractions.get(tile["tile_id"]) if fractions else None
             label = _label_for_tile(tile, fraction, label_rule, min_oocyte_area_fraction)
             rows.append(
@@ -182,8 +185,9 @@ def load_tile_index(
     missing = sorted(set(slides) - seen_stems)
     if missing and not allow_missing_slides:
         raise ValueError(
-            f"{len(missing)} slide(s) in the split manifest have no tiles under "
-            f"{tiles_root}: {', '.join(missing)}. A partial tile tree would silently "
+            f"{len(missing)} slide(s) in the split manifest contribute no tiles at "
+            f"sizes {sorted(wanted)} under {tiles_root}: {', '.join(missing)}. A partial "
+            "tile tree, or a size those slides were never tiled at, would silently "
             "shrink the evaluation splits; pass allow_missing_slides=True for a "
             "deliberate subset run."
         )
