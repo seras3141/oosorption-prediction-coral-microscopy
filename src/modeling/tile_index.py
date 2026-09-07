@@ -101,10 +101,11 @@ def load_tile_index(
     Raises
     ------
     ValueError
-        If ``label_rule`` is unknown, if no manifests are found, if a stem under
-        ``tiles_dir`` is absent from the split manifest -- an unassigned slide is a
-        broken split, not a slide to quietly drop -- or, unless
-        ``allow_missing_slides``, if a slide in the split manifest has no tiles.
+        If ``label_rule`` is unknown, if no manifests are found, if ``tile_sizes``
+        matches no tile in any manifest, if a stem under ``tiles_dir`` is absent from the
+        split manifest -- an unassigned slide is a broken split, not a slide to quietly
+        drop -- or, unless ``allow_missing_slides``, if a slide in the split manifest has
+        no tiles.
 
     Examples
     --------
@@ -169,6 +170,14 @@ def load_tile_index(
                     "split": assigned,
                 }
             )
+
+    if not rows:
+        raise ValueError(
+            f"No tiles at sizes {sorted(wanted)} in any manifest under {tiles_root}; "
+            "the manifests in this corpus carry sizes 128, 256, 512 and 1024. A size "
+            "that matches nothing would otherwise return an empty index and only fail "
+            "later, where the cause is no longer visible."
+        )
 
     missing = sorted(set(slides) - seen_stems)
     if missing and not allow_missing_slides:

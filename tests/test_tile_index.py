@@ -299,3 +299,10 @@ def test_split_manifest_slide_without_tiles_raises(tmp_path: Path) -> None:
 
     index = load_tile_index(**paths, tile_sizes=(512,), allow_missing_slides=True)
     assert "SLIDE_C" not in set(index["stem"])
+
+
+def test_tile_size_matching_no_manifest_raises(tmp_path: Path) -> None:
+    """A typo'd size would otherwise return an empty index and fail later, far from
+    the cause."""
+    with pytest.raises(ValueError, match=r"No tiles at sizes \[768\]"):
+        load_tile_index(**_corpus(tmp_path), tile_sizes=(768,))

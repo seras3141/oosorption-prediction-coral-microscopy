@@ -27,7 +27,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.modeling.tile_labels import _resolve_repo_path, compute_oocyte_area_fractions
+from src.modeling.tile_labels import (
+    _resolve_repo_path,
+    oocyte_area_fractions_for_manifest,
+)
 
 # Pinned 2026-09-04 from the full 26-slide corpus, using make_valid to repair the 57% of
 # annotation rings that self-intersect. "centroid" is the manifest flag, kept alongside
@@ -89,11 +92,19 @@ def _count(args: argparse.Namespace) -> dict[tuple[int, str], collections.Counte
     for manifest_path in manifests:
         manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
         stem, cut = manifest["stem"], manifest["cut_name"]
-        fractions = compute_oocyte_area_fractions(
-            manifest_path,
+        # Hand over the manifest already parsed here: these files total ~636 MB and
+        # re-reading them is the dominant cost of this pass.
+        fractions = oocyte_area_fractions_for_manifest(
+            manifest,
             cuts_root / stem / f"{cut}_annotations.geojson",
             tile_sizes=tuple(args.tile_sizes),
+            manifest_path=Path(manifest_path),
         )
+        if stem not in split:
+            raise SystemExit(
+                f"{stem} has tiles under {tiles_root} but no entry in {split_path}; "
+                "the split manifest and the tile tree disagree."
+            )
         assigned = split[stem]["split"]
         for tile in manifest["tiles"]:
             size = tile["tile_size"]
