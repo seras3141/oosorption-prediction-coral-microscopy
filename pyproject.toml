@@ -40,6 +40,7 @@ ml = [
     "torchvision>=0.18",
     "ultralytics>=8.3",
     "torchstain>=1.4",
+    "scikit-learn>=1.5",
 ]
 sharepoint = [
     "msal>=1.28",
@@ -53,6 +54,7 @@ coral-geojson-to-yolo = "scripts.geojson_to_yolo:main"
 coral-extract-rois = "scripts.extract_ndpi_rois:main"
 coral-download-geojson = "scripts.download_geojson:main"
 coral-verify-tile-labels = "scripts.verify_tile_labels:main"
+coral-train-tile-classifier = "scripts.train_tile_classifier:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/data_preparation", "src/modeling", "scripts"]
