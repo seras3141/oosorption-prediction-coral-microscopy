@@ -41,6 +41,9 @@ ml = [
     "ultralytics>=8.3",
     "torchstain>=1.4",
     "scikit-learn>=1.5",
+    "transformers>=4.44",
+    "timm>=1.0",
+    "huggingface-hub>=0.24",
 ]
 sharepoint = [
     "msal>=1.28",
