@@ -448,3 +448,40 @@ def test_resnet_checkpoint_stores_the_whole_model() -> None:
     payload = _checkpoint_payload(build_model(config), config, 1, 0.5)
 
     assert payload["state_dict_scope"] == "model"
+
+
+def test_subsample_limit_below_two_is_refused() -> None:
+    """One row cannot hold both classes, and a single-class val split makes average
+    precision undefined every epoch, saves no checkpoint, and aborts with a message
+    that blames the tile size."""
+    with pytest.raises(ValueError, match="at least 2"):
+        _stratified_subsample(_frame(5, 20), limit=1, seed=1)
+
+
+def test_subsample_of_exactly_two_keeps_one_of_each() -> None:
+    taken = _stratified_subsample(_frame(5, 20), limit=2, seed=1)
+
+    assert len(taken) == 2
+    assert (taken["label"] == "positive").sum() == 1
+    assert (taken["label"] != "positive").sum() == 1
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--positive-fraction", "1.5"],
+        ["--positive-fraction", "0"],
+        ["--hard-negative-share", "0"],
+        ["--hard-negative-pool-fraction", "1.2"],
+        ["--min-oocyte-area-fraction", "1.2"],
+        ["--max-val-tiles", "1"],
+    ],
+)
+def test_proportions_and_caps_are_validated_at_parse_time(args: list[str]) -> None:
+    """The sampler's own range checks are only reached after the encoder weights and the
+    whole tile index have loaded, so an out-of-range flag would cost a multi-GB load and
+    a full index parse before failing."""
+    from scripts.train_tile_classifier import _parse_args
+
+    with pytest.raises(SystemExit):
+        _parse_args(args)

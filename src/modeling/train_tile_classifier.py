@@ -357,6 +357,12 @@ def _stratified_subsample(frame: pd.DataFrame, limit: int, seed: int) -> pd.Data
     the positives would make average precision undefined and hide whether the loop is
     actually learning anything.
     """
+    if limit < 2:
+        raise ValueError(
+            f"limit must be at least 2 to keep one tile of each class, got {limit}; "
+            "a single-class validation split makes average precision undefined and "
+            "saves no checkpoint"
+        )
     if len(frame) <= limit:
         return frame
     positives = frame.loc[frame["label"] == LABEL_POSITIVE]
@@ -424,10 +430,20 @@ def train(config: TrainingConfig) -> TrainingResult:
     checkpoint_path = run_dir / "checkpoint.pt"
     run_log_path = run_dir / "training_log.json"
     # The run directory is deterministic, so a re-run of the same configuration would
-    # otherwise leave the previous execution's checkpoint and log beside this one's
+    # otherwise leave the previous execution's log and evaluation beside this one's
     # partial composition log -- and anything reading the checkpoint would score a
     # different execution than the logs describe.
-    for stale in (composition_log, checkpoint_path, run_log_path):
+    #
+    # checkpoint.pt is deliberately NOT cleared. It is overwritten on the first
+    # improving epoch, and pre-deleting it would mean a re-run killed early -- a
+    # preempted GPU job, or a failure inside prepare_splits -- left the directory with
+    # no checkpoint at all, destroying a result that was still scoreable.
+    for stale in (
+        composition_log,
+        run_log_path,
+        run_dir / "results.json",
+        run_dir / "predictions.csv",
+    ):
         stale.unlink(missing_ok=True)
 
     splits = prepare_splits(config)

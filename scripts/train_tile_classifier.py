@@ -37,6 +37,29 @@ def _positive_int(value: str) -> int:
     return number
 
 
+def _at_least_two(value: str) -> int:
+    """Validation caps need room for one tile of each class."""
+    number = int(value)
+    if number < 2:
+        raise argparse.ArgumentTypeError(
+            f"must be at least 2, to keep one tile of each class; got {number}"
+        )
+    return number
+
+
+def _unit_interval(value: str) -> float:
+    """An argparse type for proportions in the open interval (0, 1).
+
+    Checked here rather than inside the sampler, which is only reached after the encoder
+    weights and the whole tile index have been loaded -- so an out-of-range value would
+    otherwise cost a multi-GB load and a full index parse before failing.
+    """
+    number = float(value)
+    if not 0.0 < number < 1.0:
+        raise argparse.ArgumentTypeError(f"must be in (0, 1), got {number}")
+    return number
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--architecture", choices=ARCHITECTURES, default="resnet18")
@@ -50,7 +73,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--label-rule", choices=LABEL_RULES, default="area")
     parser.add_argument(
-        "--min-oocyte-area-fraction", type=float,
+        "--min-oocyte-area-fraction", type=_unit_interval,
         default=DEFAULT_MIN_OOCYTE_AREA_FRACTION,
         help="Coverage at or above which a tile is positive. Default: %(default)s.",
     )
@@ -63,14 +86,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "frozen encoder's probe head.",
     )
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--positive-fraction", type=float, default=0.25)
+    parser.add_argument("--positive-fraction", type=_unit_interval, default=0.25)
     parser.add_argument(
         "--hard-negative-mining", action="store_true",
         help="Refused under the centroid label rule, which it would train on the noise of.",
     )
     parser.add_argument("--warmup-epochs", type=_positive_int, default=3)
-    parser.add_argument("--hard-negative-pool-fraction", type=float, default=0.25)
-    parser.add_argument("--hard-negative-share", type=float, default=0.5)
+    parser.add_argument("--hard-negative-pool-fraction", type=_unit_interval, default=0.25)
+    parser.add_argument("--hard-negative-share", type=_unit_interval, default=0.5)
     parser.add_argument(
         "--head-hidden-dim", type=_positive_int, default=None,
         help="Frozen-encoder head width. Recorded with the run, because a head-only "
@@ -88,7 +111,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Smoke tests only: shorten the epoch. Default is one pass over the negatives.",
     )
     parser.add_argument(
-        "--max-val-tiles", type=_positive_int, default=None,
+        "--max-val-tiles", type=_at_least_two, default=None,
         help="Smoke tests only: cap validation tiles, class-stratified. Default is the "
              "whole val split, which is what a real run must evaluate on.",
     )

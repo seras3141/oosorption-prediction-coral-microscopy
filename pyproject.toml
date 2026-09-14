@@ -36,8 +36,14 @@ notebooks = [
     "ipywidgets>=8.0",
 ]
 ml = [
-    "torch>=2.3",
-    "torchvision>=0.18",
+    # Pinned, not floated. A re-resolve while adding transformers/timm silently moved
+    # torch 2.14 -> 2.12 and cuDNN 9.24 -> 9.20, after which every GPU convolution died
+    # with CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH on nodes that had worked before.
+    # 2.14 is the version verified end-to-end on an A100 here, so it is pinned to that
+    # minor rather than floored: a later minor re-pairs torch with a different bundled
+    # cuDNN and can reproduce the same failure.
+    "torch==2.14.*",
+    "torchvision==0.29.*",
     "ultralytics>=8.3",
     "torchstain>=1.4",
     "scikit-learn>=1.5",
@@ -58,6 +64,7 @@ coral-extract-rois = "scripts.extract_ndpi_rois:main"
 coral-download-geojson = "scripts.download_geojson:main"
 coral-verify-tile-labels = "scripts.verify_tile_labels:main"
 coral-train-tile-classifier = "scripts.train_tile_classifier:main"
+coral-evaluate-tile-classifier = "scripts.evaluate_tile_classifier:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/data_preparation", "src/modeling", "scripts"]
