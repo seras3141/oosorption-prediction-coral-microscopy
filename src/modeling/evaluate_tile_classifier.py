@@ -398,14 +398,18 @@ def _bootstrap_intervals(
     there.
     """
     specimens = np.array([specimen_of(stem) for stem in frame["stem"]])
-    unique_slides = np.unique(specimens)
+    unique_specimens = np.unique(specimens)
     rng = np.random.default_rng(seed)
-    by_slide = {group: np.flatnonzero(specimens == group) for group in unique_slides}
+    rows_by_specimen = {
+        specimen: np.flatnonzero(specimens == specimen) for specimen in unique_specimens
+    }
 
     collected: dict[str, list[float]] = {"auprc": [], "f1": [], "recall": []}
     for _ in range(bootstrap_samples):
-        drawn = rng.choice(unique_slides, size=len(unique_slides), replace=True)
-        rows = np.concatenate([by_slide[slide] for slide in drawn])
+        drawn = rng.choice(
+            unique_specimens, size=len(unique_specimens), replace=True
+        )
+        rows = np.concatenate([rows_by_specimen[specimen] for specimen in drawn])
         sample_targets = targets[rows]
         if len(np.unique(sample_targets)) < 2:
             continue
