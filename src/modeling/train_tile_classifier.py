@@ -20,7 +20,9 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import random
+import tempfile
 import re
 import time
 import hashlib
@@ -48,6 +50,7 @@ from src.modeling.samplers import ForcedRatioBatchSampler, check_mining_allowed
 from src.modeling.tile_classification_dataset import TileClassificationDataset
 from src.modeling.tile_index import (
     LABEL_RULE_AREA,
+    LABEL_RULE_CENTROID,
     binary_targets,
     load_tile_index,
     training_rows,
@@ -114,7 +117,13 @@ class TrainingConfig:
     output_dir: str = "data/tile_classifier"
 
     #: Fields that do not change a run's numbers and so stay out of its fingerprint.
-    RUN_ID_EXCLUDED: ClassVar[tuple[str, ...]] = ("num_workers", "output_dir")
+    #:
+    #: num_workers is NOT here. Augmentation runs inside the DataLoader workers, which
+    #: are seeded per worker, so the worker count changes which RNG stream each sample
+    #: draws from -- and 0 runs augmentation in the main stream instead. Two runs with
+    #: different worker counts follow different training trajectories, so they must not
+    #: share a run id and overwrite each other.
+    RUN_ID_EXCLUDED: ClassVar[tuple[str, ...]] = ("output_dir",)
 
     def __post_init__(self) -> None:
         """Resolve defaults here so the recorded config describes what actually ran.
@@ -153,6 +162,11 @@ class TrainingConfig:
             # Head geometry only exists on the frozen arm.
             self.head_hidden_dim = DEFAULT_HEAD_HIDDEN_DIM
             self.head_dropout = DEFAULT_HEAD_DROPOUT
+        if self.label_rule == LABEL_RULE_CENTROID:
+            # The centroid rule ignores the coverage threshold entirely, so two runs
+            # differing only in it train on identical labels and must not be filed as
+            # separate experiments.
+            self.min_oocyte_area_fraction = DEFAULT_MIN_OOCYTE_AREA_FRACTION
 
     def run_id(self) -> str:
         """Identify a run by everything that changes its numbers.
@@ -295,15 +309,25 @@ def build_transforms(
     return transforms.Compose(steps)
 
 
-def build_model(config: TrainingConfig) -> nn.Module:
+def build_model(config: TrainingConfig, pretrained: bool = True) -> nn.Module:
     """Build the classifier for the configured architecture.
 
     Returns a model whose forward gives one logit per tile.
+
+    Parameters
+    ----------
+    config : TrainingConfig
+        The run's configuration.
+    pretrained : bool, optional
+        Load the backbone's pretrained weights. Evaluation passes False: a checkpoint
+        already carries every parameter, so fetching ImageNet weights only to overwrite
+        them costs a download that can fail outright on a node with no cache and no
+        egress.
     """
     if config.architecture == ARCHITECTURE_RESNET18:
         from torchvision.models import ResNet18_Weights, resnet18
 
-        model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+        model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1 if pretrained else None)
         model.fc = nn.Linear(model.fc.in_features, 1)
         return model
     if config.architecture == ARCHITECTURE_FROZEN_ENCODER:
@@ -556,8 +580,10 @@ def train(config: TrainingConfig) -> TrainingResult:
         improved = not math.isnan(average_precision) and average_precision > best_ap
         if improved:
             best_ap, best_epoch, epochs_without_gain = average_precision, epoch, 0
-            torch.save(_checkpoint_payload(model, config, epoch, average_precision),
-                       checkpoint_path)
+            _save_checkpoint_atomically(
+                _checkpoint_payload(model, config, epoch, average_precision),
+                checkpoint_path,
+            )
         else:
             epochs_without_gain += 1
             if epochs_without_gain >= config.patience:
@@ -650,6 +676,40 @@ def _check_mining_configuration(config: TrainingConfig) -> None:
             "a share of 0 would score the whole negative pool and then never draw from "
             "it, leaving the run indistinguishable from mining-off"
         )
+    # The realised quota, not just the proportion: a small share against a small batch
+    # rounds to zero hard negatives, and the run then reports mining active while
+    # drawing none -- the mining-off arm wearing the mining arm's label.
+    negatives_per_batch = config.batch_size - round(
+        config.batch_size * config.positive_fraction
+    )
+    if round(negatives_per_batch * config.hard_negative_share) < 1:
+        raise ValueError(
+            f"hard_negative_share {config.hard_negative_share} against "
+            f"{negatives_per_batch} negative(s) per batch rounds to zero hard "
+            "negatives, so mining would draw none while the run recorded itself as the "
+            "mining arm; raise the share or the batch size"
+        )
+
+
+def _save_checkpoint_atomically(payload: dict[str, Any], path: Path) -> None:
+    """Write the checkpoint to a sibling temp file, then replace in one step.
+
+    Saving in place truncates the previous checkpoint before the replacement is
+    complete, so a preemption mid-write leaves a corrupt file -- and this run directory
+    deliberately keeps the previous checkpoint precisely so a killed re-run does not
+    destroy a still-scoreable result. An in-place write would defeat that. os.replace is
+    atomic within a filesystem, and the temp file is a sibling to stay on one.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temp_name = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    os.close(handle)
+    temp_path = Path(temp_name)
+    try:
+        torch.save(payload, temp_path)
+        os.replace(temp_path, path)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
 
 
 def _checkpoint_payload(

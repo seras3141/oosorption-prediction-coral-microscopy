@@ -270,20 +270,20 @@ def test_pooler_is_still_used_when_there_is_no_hidden_state() -> None:
                           torch.ones(2, EMBED_DIM))
 
 
-def test_forcing_offline_mode_actually_takes_effect() -> None:
+def test_offline_mode_actually_takes_effect_inside_the_block() -> None:
     """Writing HF_HUB_OFFLINE to the environment is not enough: huggingface_hub reads it
     once at import into a module constant, and importing timm already imported the hub,
     so a later env write lands too late and the fetch proceeds anyway."""
     from huggingface_hub import constants
 
-    from src.modeling.encoders import _force_offline_hub
+    from src.modeling.encoders import _offline_hub
 
     original = constants.HF_HUB_OFFLINE
     try:
         constants.HF_HUB_OFFLINE = False
-        _force_offline_hub()
-        assert constants.HF_HUB_OFFLINE is True
-        assert constants.is_offline_mode() is True
+        with _offline_hub():
+            assert constants.HF_HUB_OFFLINE is True
+            assert constants.is_offline_mode() is True
     finally:
         constants.HF_HUB_OFFLINE = original
 
@@ -297,3 +297,41 @@ def test_head_geometry_is_exposed_for_the_checkpoint_to_record() -> None:
     assert model.hidden_dim == 64
     assert model.dropout == pytest.approx(0.1)
     assert model.head[0].out_features == 64
+
+
+def test_offline_override_is_scoped_not_permanent() -> None:
+    """Left set, a later load_encoder(local_files_only=False) silently could not fetch,
+    contradicting that opt-out and breaking any process loading two encoders."""
+    import os
+
+    from huggingface_hub import constants
+
+    from src.modeling.encoders import _offline_hub
+
+    constants.HF_HUB_OFFLINE = False
+    os.environ.pop("HF_HUB_OFFLINE", None)
+
+    with _offline_hub():
+        assert constants.HF_HUB_OFFLINE is True
+        assert os.environ["HF_HUB_OFFLINE"] == "1"
+
+    assert constants.HF_HUB_OFFLINE is False
+    assert "HF_HUB_OFFLINE" not in os.environ
+
+
+def test_offline_override_restores_a_pre_existing_setting() -> None:
+    import os
+
+    from huggingface_hub import constants
+
+    from src.modeling.encoders import _offline_hub
+
+    os.environ["HF_HUB_OFFLINE"] = "0"
+    constants.HF_HUB_OFFLINE = False
+    try:
+        with _offline_hub():
+            assert constants.HF_HUB_OFFLINE is True
+        assert os.environ["HF_HUB_OFFLINE"] == "0"
+        assert constants.HF_HUB_OFFLINE is False
+    finally:
+        os.environ.pop("HF_HUB_OFFLINE", None)

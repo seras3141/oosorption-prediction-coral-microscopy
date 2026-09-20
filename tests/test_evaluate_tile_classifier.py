@@ -436,3 +436,41 @@ def test_specimen_count_is_reported_alongside_the_slide_count() -> None:
 
     assert metrics["n_slides"] == 4
     assert metrics["n_specimens"] == 2
+
+
+def test_threshold_candidates_come_from_the_observed_probabilities() -> None:
+    """F1 only changes where the cut crosses an actual prediction, so an evenly spaced
+    grid can step over a narrow optimum: with one positive at 0.504 and one negative at
+    0.501, a 199-step grid's best F1 was 0.667 where cutting at 0.504 gives 1.0."""
+    from sklearn.metrics import f1_score
+
+    targets = np.array([1, 0])
+    probs = np.array([0.504, 0.501])
+
+    threshold, how = select_threshold(targets, probs)
+
+    assert how == "max_val_f1"
+    assert f1_score(targets, (probs >= threshold).astype(int)) == pytest.approx(1.0)
+
+
+def test_threshold_selection_is_capped_on_a_large_split() -> None:
+    """Candidates track the predictions, but the search stays bounded."""
+    from src.modeling.evaluate_tile_classifier import MAX_THRESHOLD_CANDIDATES
+
+    rng = np.random.default_rng(0)
+    targets = (rng.random(5000) < 0.2).astype(int)
+    probs = np.clip(targets * 0.3 + rng.normal(0.4, 0.15, 5000), 0.0, 1.0)
+
+    threshold, how = select_threshold(targets, probs)
+
+    assert how == "max_val_f1"
+    assert 0.0 <= threshold <= 1.0
+    assert len(np.unique(probs)) > MAX_THRESHOLD_CANDIDATES
+
+
+def test_bootstrap_samples_below_one_is_refused(tmp_path: Path) -> None:
+    """Zero would complete with every interval null while recording the count."""
+    from src.modeling.evaluate_tile_classifier import evaluate
+
+    with pytest.raises(ValueError, match="at least 1"):
+        evaluate(tmp_path, bootstrap_samples=0)

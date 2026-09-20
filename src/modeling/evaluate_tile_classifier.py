@@ -74,10 +74,9 @@ DEFAULT_BOOTSTRAP_SAMPLES = 2000
 #: Only a fallback. The operating point is normally selected on validation; this is what
 #: is used when that selection cannot run, e.g. a single-class validation split.
 FALLBACK_DECISION_THRESHOLD = 0.5
-#: Candidate thresholds for the validation sweep. 199 points is finer than the
-#: probability resolution of a few thousand tiles, so a coarser grid would be the only
-#: thing limiting the chosen point.
-THRESHOLD_GRID_STEPS = 199
+#: Cap on candidate thresholds considered during selection. Candidates come from the
+#: observed probabilities, so this only bounds the work on a large split.
+MAX_THRESHOLD_CANDIDATES = 512
 
 def specimen_of(stem: str) -> str:
     """The specimen a slide belongs to, which is the unit that is actually independent.
@@ -145,6 +144,11 @@ def evaluate(
     FileNotFoundError
         If the run directory holds no checkpoint.
     """
+    if bootstrap_samples < 1:
+        raise ValueError(
+            f"bootstrap_samples must be at least 1, got {bootstrap_samples}; zero would "
+            "complete with every confidence interval null while recording the count"
+        )
     run_path = _resolve_repo_path(run_dir)
     checkpoint_path = run_path / "checkpoint.pt"
     if not checkpoint_path.exists():
@@ -243,7 +247,10 @@ def _restore_model(config: TrainingConfig, checkpoint: dict[str, Any]) -> torch.
         )
         model.head.load_state_dict(state)
         return model
-    model = build_model(config)
+    # pretrained=False: the checkpoint carries every parameter, so fetching ImageNet
+    # weights only to overwrite them costs a download that fails outright on a node
+    # with no cache and no egress.
+    model = build_model(config, pretrained=False)
     model.load_state_dict(state)
     return model
 
@@ -292,17 +299,30 @@ def select_threshold(targets: np.ndarray, probabilities: np.ndarray) -> tuple[fl
         )
         return FALLBACK_DECISION_THRESHOLD, "fallback_single_class"
 
-    grid = np.linspace(0.0, 1.0, THRESHOLD_GRID_STEPS + 2)[1:-1]
+    # Candidates are the observed probabilities, not a fixed grid. F1 only changes
+    # where the cut crosses an actual prediction, so an evenly spaced grid can step
+    # straight over a narrow optimum: with one positive at 0.504 and one negative at
+    # 0.501, every point of a 199-step grid scores both the same way and the best F1
+    # found is 0.667, where cutting at 0.504 gives 1.0.
+    candidates = np.unique(probabilities)
+    if len(candidates) > MAX_THRESHOLD_CANDIDATES:
+        # Quantiles keep the candidates where the predictions actually are, which an
+        # evenly spaced grid does not.
+        candidates = np.unique(
+            np.quantile(candidates, np.linspace(0.0, 1.0, MAX_THRESHOLD_CANDIDATES))
+        )
     scores = [f1_score(targets, (probabilities >= t).astype(int), zero_division=0)
-              for t in grid]
+              for t in candidates]
     best = int(np.argmax(scores))
     LOG.info(
-        "Validation-selected threshold %.4f (F1 %.4f); 0.50 would give F1 %.4f",
-        grid[best],
+        "Validation-selected threshold %.6f (F1 %.4f) from %d candidates; "
+        "0.50 would give F1 %.4f",
+        candidates[best],
         scores[best],
+        len(candidates),
         f1_score(targets, (probabilities >= 0.5).astype(int), zero_division=0),
     )
-    return float(grid[best]), "max_val_f1"
+    return float(candidates[best]), "max_val_f1"
 
 
 def _split_metrics(

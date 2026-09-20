@@ -63,10 +63,11 @@ def test_every_setting_that_changes_the_numbers_changes_the_run_id(changed: dict
     assert TrainingConfig(**changed).run_id() != TrainingConfig().run_id()
 
 
-@pytest.mark.parametrize("field", ["num_workers", "output_dir"])
-def test_settings_that_do_not_change_the_numbers_keep_the_run_id(field: str) -> None:
-    value = 1 if field == "num_workers" else "somewhere/else"
-    assert TrainingConfig(**{field: value}).run_id() == TrainingConfig().run_id()
+def test_output_dir_does_not_change_the_run_id() -> None:
+    """Where results are written has no bearing on what they are. num_workers is the
+    opposite case and is covered by test_worker_count_changes_the_run_id: it steers the
+    augmentation RNG, so it does belong in the fingerprint."""
+    assert TrainingConfig(output_dir="somewhere/else").run_id() == TrainingConfig().run_id()
 
 
 @pytest.mark.parametrize(
@@ -485,3 +486,76 @@ def test_proportions_and_caps_are_validated_at_parse_time(args: list[str]) -> No
 
     with pytest.raises(SystemExit):
         _parse_args(args)
+
+
+def test_a_failed_checkpoint_write_leaves_the_previous_one_intact(tmp_path: Path) -> None:
+    """The run directory keeps the previous checkpoint so a killed re-run does not
+    destroy a scoreable result -- which an in-place write would defeat anyway, by
+    truncating it before the replacement completes."""
+    from src.modeling.train_tile_classifier import _save_checkpoint_atomically
+
+    path = tmp_path / "checkpoint.pt"
+    _save_checkpoint_atomically({"epoch": 1, "w": torch.zeros(3)}, path)
+    original = path.read_bytes()
+
+    with pytest.raises(Exception):
+        _save_checkpoint_atomically({"epoch": 2, "w": lambda x: x}, path)
+
+    assert path.read_bytes() == original
+    assert torch.load(path, weights_only=False)["epoch"] == 1
+    assert [p.name for p in tmp_path.iterdir()] == ["checkpoint.pt"]
+
+
+def test_a_successful_checkpoint_write_replaces(tmp_path: Path) -> None:
+    from src.modeling.train_tile_classifier import _save_checkpoint_atomically
+
+    path = tmp_path / "checkpoint.pt"
+    _save_checkpoint_atomically({"epoch": 1}, path)
+    _save_checkpoint_atomically({"epoch": 2}, path)
+
+    assert torch.load(path, weights_only=False)["epoch"] == 2
+
+
+def test_worker_count_changes_the_run_id() -> None:
+    """Augmentation runs inside the DataLoader workers, which are seeded per worker, so
+    the worker count changes which RNG stream each sample draws from. Two different
+    training trajectories must not share a run id."""
+    assert TrainingConfig(num_workers=2).run_id() != TrainingConfig(num_workers=8).run_id()
+    assert TrainingConfig(output_dir="elsewhere").run_id() == TrainingConfig().run_id()
+
+
+def test_centroid_runs_do_not_split_on_a_threshold_that_rule_ignores() -> None:
+    """The centroid rule ignores min_oocyte_area_fraction, so two such runs train on
+    identical labels and must not be filed as separate experiments."""
+    lenient = TrainingConfig(label_rule="centroid", min_oocyte_area_fraction=0.05)
+    strict = TrainingConfig(label_rule="centroid", min_oocyte_area_fraction=0.25)
+    assert lenient.run_id() == strict.run_id()
+
+    # The area rule does use it, so it must still separate them.
+    assert (
+        TrainingConfig(label_rule="area", min_oocyte_area_fraction=0.05).run_id()
+        != TrainingConfig(label_rule="area", min_oocyte_area_fraction=0.25).run_id()
+    )
+
+
+def test_mining_share_rounding_to_no_hard_negatives_is_refused() -> None:
+    """The proportion is in range but the realised quota is zero, so mining would draw
+    nothing while the run recorded itself as the mining arm."""
+    from src.modeling.train_tile_classifier import _check_mining_configuration
+
+    config = TrainingConfig(
+        hard_negative_mining=True, batch_size=2, positive_fraction=0.5,
+        hard_negative_share=0.1, warmup_epochs=1, epochs=5, patience=3,
+    )
+    with pytest.raises(ValueError, match="rounds to zero hard"):
+        _check_mining_configuration(config)
+
+
+def test_evaluation_does_not_request_pretrained_weights() -> None:
+    """A checkpoint carries every parameter, so fetching ImageNet weights only to
+    overwrite them costs a download that fails on a node with no cache and no egress."""
+    trained = build_model(TrainingConfig(), pretrained=True)
+    restored = build_model(TrainingConfig(), pretrained=False)
+
+    assert not torch.allclose(trained.conv1.weight, restored.conv1.weight)
+    assert trained.fc.out_features == restored.fc.out_features == 1

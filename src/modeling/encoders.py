@@ -23,8 +23,10 @@ native magnification, and the four embeddings are mean-pooled.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -111,28 +113,45 @@ SUPPORTED_ENCODERS = tuple(ENCODER_SPECS)
 ENCODER_LICENCES = {name: spec.licence for name, spec in ENCODER_SPECS.items()}
 
 
-def _force_offline_hub() -> None:
-    """Make ``huggingface_hub`` refuse network access for the rest of this process.
+@contextlib.contextmanager
+def _offline_hub() -> Iterator[None]:
+    """Make ``huggingface_hub`` refuse network access, for this block only.
 
     ``timm.create_model`` has no ``local_files_only``, so the only lever is the hub's
-    offline mode. Setting ``HF_HUB_OFFLINE`` in the environment here does **not** work:
-    ``huggingface_hub`` reads it once at import time into a module constant, and
-    importing timm already imported the hub, so the write lands too late and the fetch
-    proceeds anyway -- exactly the mid-run network hang the cache-only promise is meant
-    to prevent. The constant has to be assigned directly.
+    offline mode. Setting ``HF_HUB_OFFLINE`` in the environment is not enough:
+    ``huggingface_hub`` reads it once at import into a module constant, and importing
+    timm already imported the hub, so the write lands too late and the fetch proceeds
+    anyway -- the mid-run network hang the cache-only promise exists to prevent. The
+    constant has to be assigned directly.
 
-    Also sets the environment variable so any subprocess or later import agrees.
+    Scoped rather than permanent: leaving it set would mean a later
+    ``load_encoder(..., local_files_only=False)`` silently could not fetch, which
+    contradicts that opt-out and breaks any process loading more than one encoder.
     """
+    previous_env = os.environ.get("HF_HUB_OFFLINE")
     os.environ["HF_HUB_OFFLINE"] = "1"
+    constants = None
+    previous_constant = None
     try:
-        from huggingface_hub import constants
+        from huggingface_hub import constants as hub_constants
 
+        constants = hub_constants
+        previous_constant = constants.HF_HUB_OFFLINE
         constants.HF_HUB_OFFLINE = True
     except Exception:  # pragma: no cover - hub layout changed
         LOG.warning(
             "Could not force huggingface_hub offline mode; a missing weight may reach "
             "the network instead of failing at startup"
         )
+    try:
+        yield
+    finally:
+        if constants is not None:
+            constants.HF_HUB_OFFLINE = previous_constant
+        if previous_env is None:
+            os.environ.pop("HF_HUB_OFFLINE", None)
+        else:
+            os.environ["HF_HUB_OFFLINE"] = previous_env
 
 
 def encoder_spec(encoder_name: str) -> EncoderSpec:
@@ -363,14 +382,13 @@ def load_encoder(
     else:
         import timm
 
-        if local_files_only:
-            _force_offline_hub()
-        encoder = timm.create_model(
-            f"hf-hub:{encoder_name}",
-            pretrained=True,
-            num_classes=0,
-            **spec.model_kwargs,
-        )
+        with _offline_hub() if local_files_only else contextlib.nullcontext():
+            encoder = timm.create_model(
+                f"hf-hub:{encoder_name}",
+                pretrained=True,
+                num_classes=0,
+                **spec.model_kwargs,
+            )
         embedding_dim = int(encoder.num_features)
 
     LOG.info("%s embedding dim %d", encoder_name, embedding_dim)
