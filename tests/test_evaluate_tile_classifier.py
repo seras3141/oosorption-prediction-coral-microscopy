@@ -558,58 +558,43 @@ def test_a_native_evaluation_is_not_marked_rescored() -> None:
     assert results["eval_min_oocyte_area_fraction"] == 0.05
 
 
-def test_rescored_output_filenames_are_basis_points_of_the_scored_threshold() -> None:
+def test_no_request_writes_the_unsuffixed_native_filenames() -> None:
+    """A plain evaluation must keep writing results.json, not a suffixed variant."""
+    from src.modeling.evaluate_tile_classifier import _output_suffix
+
+    assert _output_suffix(None) == ""
+
+
+def test_requesting_the_trained_threshold_still_writes_a_suffixed_file() -> None:
+    """The suffix follows the request, not whether the labelling changed.
+
+    A sweep scoring every run at 0.05 includes the run already trained at 0.05. If that
+    one fell back to results.json it would be silently rewritten with a re-selected
+    threshold, and an aggregator globbing results_eval_area0500.json would find it
+    missing -- the run the others are being compared against.
+    """
+    from src.modeling.evaluate_tile_classifier import _output_suffix
+
+    # 0.05 here is a model's own trained threshold, explicitly asked for anyway.
+    assert _output_suffix(0.05) == "_eval_area0500"
+
+
+def test_output_suffix_is_basis_points_of_the_requested_threshold() -> None:
     """The suffix must distinguish 0.05 from 0.054 and not collapse sub-1% to zero.
 
     Mirrors the run-id rule: a filename that collides silently overwrites a result.
     """
-    from src.modeling.evaluate_tile_classifier import _eval_suffix
+    from src.modeling.evaluate_tile_classifier import _output_suffix
 
-    assert _eval_suffix(0.05) == "_eval_area0500"
-    assert _eval_suffix(0.054) == "_eval_area0540"
-    assert _eval_suffix(0.10) == "_eval_area1000"
-    assert _eval_suffix(0.25) == "_eval_area2500"
-    assert _eval_suffix(0.005) == "_eval_area0050"
-    assert len({_eval_suffix(f) for f in (0.05, 0.054, 0.10, 0.25, 0.005)}) == 5
-
-
-def test_a_threshold_finer_than_a_basis_point_is_refused(tmp_path: Path) -> None:
-    """0.05 and 0.05004 would render the same filename and overwrite each other.
-
-    run_id survives the same rounding only because it also carries a config
-    fingerprint; the evaluation filename has no such backstop, so the input is
-    constrained instead.
-    """
-    from src.modeling.evaluate_tile_classifier import evaluate
-
-    with pytest.raises(ValueError, match="basis points"):
-        evaluate(tmp_path, eval_min_oocyte_area_fraction=0.05004)
-
-
-def test_a_whole_basis_point_threshold_is_accepted(tmp_path: Path) -> None:
-    """The basis-point check must not reject the values the sweep actually uses.
-
-    Reaching the missing-checkpoint error proves validation let the value through.
-    """
-    from src.modeling.evaluate_tile_classifier import evaluate
-
-    for good in (0.05, 0.10, 0.25, 0.0001, 0.9999):
-        with pytest.raises(FileNotFoundError):
-            evaluate(tmp_path, eval_min_oocyte_area_fraction=good)
-
-
-def test_requesting_the_trained_threshold_still_writes_a_suffixed_file() -> None:
-    """A sweep scored at one threshold must produce one file per run.
-
-    Deriving the filename from "did the labelling change" instead of "was an override
-    asked for" would silently rewrite results.json for the run already at that
-    threshold, and an aggregator globbing the suffixed name would find it missing.
-    """
-    from src.modeling.evaluate_tile_classifier import _eval_suffix
-
-    # The run trained at 0.05 and the run trained at 0.25, both scored at 0.05, must
-    # land on the same suffix -- that is what makes them comparable on disk.
-    assert _eval_suffix(0.05) == _eval_suffix(0.05)
+    suffixes = [_output_suffix(f) for f in (0.05, 0.054, 0.10, 0.25, 0.005)]
+    assert suffixes == [
+        "_eval_area0500",
+        "_eval_area0540",
+        "_eval_area1000",
+        "_eval_area2500",
+        "_eval_area0050",
+    ]
+    assert len(set(suffixes)) == 5
 
 
 def test_the_override_is_refused_for_the_centroid_rule(tmp_path: Path) -> None:

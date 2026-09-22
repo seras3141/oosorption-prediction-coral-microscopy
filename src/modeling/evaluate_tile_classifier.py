@@ -108,13 +108,21 @@ PREDICTION_COLUMNS = (
 )
 
 
-def _eval_suffix(scoring_area_fraction: float) -> str:
-    """Filename suffix for a run scored against an explicitly requested labelling.
+def _output_suffix(eval_min_oocyte_area_fraction: float | None) -> str:
+    """Filename suffix, decided by whether a labelling was *requested*.
+
+    Takes the request rather than the resolved threshold, because the distinction is the
+    whole point: asking for the labelling a model was already trained under must still
+    write a suffixed file. Deriving this from "did the labelling change" instead would
+    make a sweep scored at one threshold rewrite results.json for the run already at
+    that value, and an aggregator globbing the suffixed name would find it missing.
 
     Basis points, so 0.05 and 0.054 do not both render "05" and a sub-1% threshold does
     not render "00" -- the same rule the run id uses for the trained threshold.
     """
-    return f"_eval_area{round(scoring_area_fraction * 10000):04d}"
+    if eval_min_oocyte_area_fraction is None:
+        return ""
+    return f"_eval_area{round(eval_min_oocyte_area_fraction * 10000):04d}"
 
 
 def evaluate(
@@ -199,7 +207,11 @@ def evaluate(
             f"{checkpoint_path} does not exist; evaluation needs a finished training run"
         )
 
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    # weights_only=True: evaluate() takes a directory path, so the checkpoint need not
+    # have come from this trainer, and the unrestricted loader unpickles arbitrary
+    # globals before anything validates the file. The payload is tensors plus a dict of
+    # primitives (see _checkpoint_payload), so the restricted loader is sufficient.
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     config = TrainingConfig(**checkpoint["config"])
     if eval_min_oocyte_area_fraction is not None and config.label_rule != LABEL_RULE_AREA:
         # Checked here, before the backbone is restored: the centroid rule labels from
@@ -231,13 +243,9 @@ def evaluate(
         if eval_min_oocyte_area_fraction is None
         else float(eval_min_oocyte_area_fraction)
     )
-    # Two different things, deliberately kept apart: `requested` decides where output is
-    # written, `rescored` records whether the labelling actually differs. Deriving the
-    # filename from the comparison instead would make a sweep that scores every run at
-    # 0.05 write suffixed files for the runs trained elsewhere while silently rewriting
-    # results.json for the one already at 0.05 -- which then goes missing from any
-    # aggregator globbing the suffixed name.
-    requested = eval_min_oocyte_area_fraction is not None
+    # Where output is written is decided by _output_suffix from the *request*; this flag
+    # records only whether the labelling actually differs, and the two are not the same
+    # question -- see that function.
     rescored = scoring_area_fraction != config.min_oocyte_area_fraction
     if rescored:
         LOG.info(
@@ -296,7 +304,7 @@ def evaluate(
 
     # A rescoring writes beside the run's own evaluation rather than over it: both are
     # legitimate results for the same checkpoint and answer different questions.
-    suffix = _eval_suffix(scoring_area_fraction) if requested else ""
+    suffix = _output_suffix(eval_min_oocyte_area_fraction)
     predictions_path = run_path / f"predictions{suffix}.csv"
     _write_predictions(predictions_path, pd.concat(predictions, ignore_index=True))
 
