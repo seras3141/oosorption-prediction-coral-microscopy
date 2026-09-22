@@ -68,3 +68,11 @@ coral-evaluate-tile-classifier = "scripts.evaluate_tile_classifier:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/data_preparation", "src/modeling", "scripts"]
+
+[tool.pytest.ini_options]
+# Without testpaths, a bare `pytest` recurses from the repo root and stats every file
+# under data/ looking for test_*.py -- roughly 975,000 tile PNGs on a Lustre filesystem.
+# That walk, not the tests, was ~98% of a 2h36m suite run; naming the directory takes it
+# back to minutes. norecursedirs is belt-and-braces for anyone who passes another path.
+testpaths = ["tests"]
+norecursedirs = ["data", "docs_hpc", "docs_local", "slurm", ".venv", ".git", "notebooks"]
