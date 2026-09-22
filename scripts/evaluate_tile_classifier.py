@@ -46,7 +46,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--bootstrap-samples", type=int, default=DEFAULT_BOOTSTRAP_SAMPLES,
-        help="Slide-level resamples for the confidence intervals. Default: %(default)s.",
+        help="Specimen-level resamples for the confidence intervals. Default: %(default)s.",
+    )
+    parser.add_argument(
+        "--eval-min-oocyte-area-fraction", type=_unit_interval, default=None,
+        help="Score against this coverage threshold instead of the one the model was "
+             "trained under, so models trained at different thresholds can be compared "
+             "on one yardstick. Always writes results_eval_area<bp>.json rather than "
+             "overwriting the run's own results.json -- including when the value equals "
+             "the trained one, so a sweep scored at a single threshold produces one "
+             "file per run. Refused for the centroid rule, which ignores coverage.",
     )
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-level", default="INFO")
@@ -64,9 +73,14 @@ def main(argv: list[str] | None = None) -> int:
         bootstrap_samples=args.bootstrap_samples,
         decision_threshold=args.decision_threshold,
         num_workers=args.num_workers,
+        eval_min_oocyte_area_fraction=args.eval_min_oocyte_area_fraction,
     )
 
     print(f"\nrun {results['run_id']}")
+    if results["is_rescored"]:
+        print(f"  RESCORED             trained at "
+              f"{results['min_oocyte_area_fraction']}, scored at "
+              f"{results['eval_min_oocyte_area_fraction']}")
     print(f"  decision threshold   {results['decision_threshold']:.4f} "
           f"({results['threshold_selection']})")
     print(f"  positive fraction    {results['positive_fraction_per_batch']} requested, "

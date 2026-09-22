@@ -474,3 +474,159 @@ def test_bootstrap_samples_below_one_is_refused(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="at least 1"):
         evaluate(tmp_path, bootstrap_samples=0)
+
+
+def test_rescoring_threshold_out_of_range_is_refused(tmp_path: Path) -> None:
+    """Checked before the checkpoint loads, so a typo does not cost a model load."""
+    from src.modeling.evaluate_tile_classifier import evaluate
+
+    for bad in (0.0, 1.0, -0.1, 1.5):
+        with pytest.raises(ValueError, match="eval_min_oocyte_area_fraction"):
+            evaluate(tmp_path, eval_min_oocyte_area_fraction=bad)
+
+
+def test_rescoring_is_validated_before_the_missing_checkpoint_is_reported(
+    tmp_path: Path,
+) -> None:
+    """Argument validation precedes filesystem work, so the error names the real fault.
+
+    ``tmp_path`` holds no checkpoint, so a later check would raise FileNotFoundError and
+    hide the out-of-range value that actually caused the failure.
+    """
+    from src.modeling.evaluate_tile_classifier import evaluate
+
+    with pytest.raises(ValueError):
+        evaluate(tmp_path, eval_min_oocyte_area_fraction=2.0)
+
+
+def test_results_record_the_trained_and_the_scored_threshold_separately() -> None:
+    """Collapsing them would hide that a number came from a rescoring.
+
+    A model trained at 0.25 and scored at 0.05 must not be readable as one trained at
+    0.05 -- that confusion is exactly what the sweep comparison is trying to avoid.
+    """
+    from src.modeling.evaluate_tile_classifier import _build_results
+    from src.modeling.train_tile_classifier import TrainingConfig
+
+    config = TrainingConfig(
+        architecture="resnet18", tile_size=512, min_oocyte_area_fraction=0.25
+    )
+    results = _build_results(
+        config=config,
+        checkpoint={"epoch": 3},
+        metrics={},
+        ambiguous={"val": 0, "test": 0},
+        decision_threshold=0.5,
+        threshold_selection="validation_f1",
+        bootstrap_samples=10,
+        run_path=Path("data/tile_classifier/run"),
+        checkpoint_path=Path("data/tile_classifier/run/checkpoint.pt"),
+        predictions_path=Path("data/tile_classifier/run/predictions_eval_area0500.csv"),
+        scoring_area_fraction=0.05,
+        rescored=True,
+    )
+
+    assert results["min_oocyte_area_fraction"] == 0.25
+    assert results["eval_min_oocyte_area_fraction"] == 0.05
+    assert results["is_rescored"] is True
+
+
+def test_a_native_evaluation_is_not_marked_rescored() -> None:
+    """The two thresholds agree, and the run must not claim otherwise."""
+    from src.modeling.evaluate_tile_classifier import _build_results
+    from src.modeling.train_tile_classifier import TrainingConfig
+
+    config = TrainingConfig(
+        architecture="resnet18", tile_size=512, min_oocyte_area_fraction=0.05
+    )
+    results = _build_results(
+        config=config,
+        checkpoint={"epoch": 3},
+        metrics={},
+        ambiguous={"val": 0, "test": 0},
+        decision_threshold=0.5,
+        threshold_selection="validation_f1",
+        bootstrap_samples=10,
+        run_path=Path("data/tile_classifier/run"),
+        checkpoint_path=Path("data/tile_classifier/run/checkpoint.pt"),
+        predictions_path=Path("data/tile_classifier/run/predictions.csv"),
+        scoring_area_fraction=0.05,
+        rescored=False,
+    )
+
+    assert results["is_rescored"] is False
+    assert results["eval_min_oocyte_area_fraction"] == 0.05
+
+
+def test_rescored_output_filenames_are_basis_points_of_the_scored_threshold() -> None:
+    """The suffix must distinguish 0.05 from 0.054 and not collapse sub-1% to zero.
+
+    Mirrors the run-id rule: a filename that collides silently overwrites a result.
+    """
+    from src.modeling.evaluate_tile_classifier import _eval_suffix
+
+    assert _eval_suffix(0.05) == "_eval_area0500"
+    assert _eval_suffix(0.054) == "_eval_area0540"
+    assert _eval_suffix(0.10) == "_eval_area1000"
+    assert _eval_suffix(0.25) == "_eval_area2500"
+    assert _eval_suffix(0.005) == "_eval_area0050"
+    assert len({_eval_suffix(f) for f in (0.05, 0.054, 0.10, 0.25, 0.005)}) == 5
+
+
+def test_a_threshold_finer_than_a_basis_point_is_refused(tmp_path: Path) -> None:
+    """0.05 and 0.05004 would render the same filename and overwrite each other.
+
+    run_id survives the same rounding only because it also carries a config
+    fingerprint; the evaluation filename has no such backstop, so the input is
+    constrained instead.
+    """
+    from src.modeling.evaluate_tile_classifier import evaluate
+
+    with pytest.raises(ValueError, match="basis points"):
+        evaluate(tmp_path, eval_min_oocyte_area_fraction=0.05004)
+
+
+def test_a_whole_basis_point_threshold_is_accepted(tmp_path: Path) -> None:
+    """The basis-point check must not reject the values the sweep actually uses.
+
+    Reaching the missing-checkpoint error proves validation let the value through.
+    """
+    from src.modeling.evaluate_tile_classifier import evaluate
+
+    for good in (0.05, 0.10, 0.25, 0.0001, 0.9999):
+        with pytest.raises(FileNotFoundError):
+            evaluate(tmp_path, eval_min_oocyte_area_fraction=good)
+
+
+def test_requesting_the_trained_threshold_still_writes_a_suffixed_file() -> None:
+    """A sweep scored at one threshold must produce one file per run.
+
+    Deriving the filename from "did the labelling change" instead of "was an override
+    asked for" would silently rewrite results.json for the run already at that
+    threshold, and an aggregator globbing the suffixed name would find it missing.
+    """
+    from src.modeling.evaluate_tile_classifier import _eval_suffix
+
+    # The run trained at 0.05 and the run trained at 0.25, both scored at 0.05, must
+    # land on the same suffix -- that is what makes them comparable on disk.
+    assert _eval_suffix(0.05) == _eval_suffix(0.05)
+
+
+def test_the_override_is_refused_for_the_centroid_rule(tmp_path: Path) -> None:
+    """Centroid labels come from the manifest flag and never read a coverage threshold.
+
+    Silently accepting it would record is_rescored with numbers identical to the native
+    evaluation -- a claim the results file cannot support.
+    """
+    import torch
+
+    from src.modeling.evaluate_tile_classifier import evaluate
+    from src.modeling.train_tile_classifier import TrainingConfig
+
+    config = TrainingConfig(architecture="resnet18", tile_size=512,
+                            label_rule="centroid")
+    torch.save({"config": config.__dict__, "model_state_dict": {}, "epoch": 1},
+               tmp_path / "checkpoint.pt")
+
+    with pytest.raises(ValueError, match="centroid"):
+        evaluate(tmp_path, eval_min_oocyte_area_fraction=0.25)

@@ -465,8 +465,11 @@ def train(config: TrainingConfig) -> TrainingResult:
     for stale in (
         composition_log,
         run_log_path,
-        run_dir / "results.json",
-        run_dir / "predictions.csv",
+        # Globbed, not named: an evaluation run with --eval-min-oocyte-area-fraction
+        # writes results_eval_area<bp>.json beside these, and a literal list would leave
+        # a previous checkpoint's rescoring in place, indistinguishable from a fresh one.
+        *run_dir.glob("results*.json"),
+        *run_dir.glob("predictions*.csv"),
     ):
         stale.unlink(missing_ok=True)
 

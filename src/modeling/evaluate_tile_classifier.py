@@ -48,6 +48,7 @@ from src.modeling.encoders import DEFAULT_ENCODER, encoder_spec, load_encoder
 from src.modeling.tile_classification_dataset import TileClassificationDataset
 from src.modeling.tile_index import (
     LABEL_AMBIGUOUS,
+    LABEL_RULE_AREA,
     binary_targets,
     load_tile_index,
     training_rows,
@@ -107,24 +108,36 @@ PREDICTION_COLUMNS = (
 )
 
 
+def _eval_suffix(scoring_area_fraction: float) -> str:
+    """Filename suffix for a run scored against an explicitly requested labelling.
+
+    Basis points, so 0.05 and 0.054 do not both render "05" and a sub-1% threshold does
+    not render "00" -- the same rule the run id uses for the trained threshold.
+    """
+    return f"_eval_area{round(scoring_area_fraction * 10000):04d}"
+
+
 def evaluate(
     run_dir: str | Path,
     bootstrap_samples: int = DEFAULT_BOOTSTRAP_SAMPLES,
     decision_threshold: float | None = None,
     num_workers: int = 4,
+    eval_min_oocyte_area_fraction: float | None = None,
 ) -> dict[str, Any]:
     """Score a finished run's checkpoint on val and test, and write its artifacts.
 
     Reconstructs the configuration from the checkpoint rather than taking it as
     arguments, so the evaluation cannot silently use a different tile size, label rule or
-    threshold than the model was trained under.
+    threshold than the model was trained under. ``eval_min_oocyte_area_fraction`` is the
+    one deliberate exception, and it is neither silent nor default: it is recorded in the
+    results and it renames the output files.
 
     Parameters
     ----------
     run_dir : str or Path
         A training run's output directory, holding ``checkpoint.pt``.
     bootstrap_samples : int, optional
-        Slide-level resamples for the confidence intervals.
+        Specimen-level resamples for the confidence intervals.
     decision_threshold : float, optional
         Probability at or above which a tile is predicted positive. Left as None -- the
         normal case -- it is chosen to maximise F1 on the validation split and then
@@ -133,6 +146,20 @@ def evaluate(
         how it was arrived at are both recorded.
     num_workers : int, optional
         Dataloader workers.
+    eval_min_oocyte_area_fraction : float, optional
+        Score against this coverage threshold instead of the one the model was trained
+        under. The checkpoint and its config are untouched; only the labelling of the
+        tiles being scored changes.
+
+        Needed to compare models trained at different thresholds. Each threshold defines
+        its own val set -- raising it moves borderline tiles into the excluded ambiguous
+        band, and those are exactly the tiles a classifier gets wrong -- so scoring each
+        model on its own labelling grades them on exams of different difficulty and
+        flatters the highest threshold. Passing one value here puts every model on the
+        same yardstick.
+
+        Results and predictions are written to ``*_eval_area<bp>`` filenames so a
+        rescoring never overwrites the run's own evaluation.
 
     Returns
     -------
@@ -149,6 +176,22 @@ def evaluate(
             f"bootstrap_samples must be at least 1, got {bootstrap_samples}; zero would "
             "complete with every confidence interval null while recording the count"
         )
+    if eval_min_oocyte_area_fraction is not None:
+        if not 0.0 < eval_min_oocyte_area_fraction < 1.0:
+            raise ValueError(
+                "eval_min_oocyte_area_fraction must be in (0, 1), got "
+                f"{eval_min_oocyte_area_fraction}"
+            )
+        # The filename carries the threshold in basis points, so two values that round
+        # together would write to one file and silently overwrite each other. run_id
+        # survives the same rounding only because it also carries a config fingerprint.
+        if round(eval_min_oocyte_area_fraction * 10000) / 10000 != (
+            eval_min_oocyte_area_fraction
+        ):
+            raise ValueError(
+                "eval_min_oocyte_area_fraction must be a whole number of basis points "
+                f"(a multiple of 0.0001), got {eval_min_oocyte_area_fraction}"
+            )
     run_path = _resolve_repo_path(run_dir)
     checkpoint_path = run_path / "checkpoint.pt"
     if not checkpoint_path.exists():
@@ -158,6 +201,16 @@ def evaluate(
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     config = TrainingConfig(**checkpoint["config"])
+    if eval_min_oocyte_area_fraction is not None and config.label_rule != LABEL_RULE_AREA:
+        # Checked here, before the backbone is restored: the centroid rule labels from
+        # the manifest's has_oocyte flag and never reads a coverage threshold, so the
+        # override would change nothing while the results still claimed a rescoring --
+        # the cross-labelling confusion this feature exists to prevent, recorded as
+        # fact. Rejecting it after _restore_model would cost a multi-GB load first.
+        raise ValueError(
+            f"eval_min_oocyte_area_fraction has no meaning under the "
+            f"{config.label_rule!r} label rule, which ignores coverage entirely"
+        )
     seed_everything(config.seed)
     LOG.info(
         "Evaluating %s (%s)",
@@ -171,10 +224,32 @@ def evaluate(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device).eval()
 
+    # An override applies to the labelling of the tiles being scored, never to the
+    # model: `config` still describes how the checkpoint was trained.
+    scoring_area_fraction = (
+        config.min_oocyte_area_fraction
+        if eval_min_oocyte_area_fraction is None
+        else float(eval_min_oocyte_area_fraction)
+    )
+    # Two different things, deliberately kept apart: `requested` decides where output is
+    # written, `rescored` records whether the labelling actually differs. Deriving the
+    # filename from the comparison instead would make a sweep that scores every run at
+    # 0.05 write suffixed files for the runs trained elsewhere while silently rewriting
+    # results.json for the one already at 0.05 -- which then goes missing from any
+    # aggregator globbing the suffixed name.
+    requested = eval_min_oocyte_area_fraction is not None
+    rescored = scoring_area_fraction != config.min_oocyte_area_fraction
+    if rescored:
+        LOG.info(
+            "Scoring against coverage %.4f, not the %.4f this model was trained under",
+            scoring_area_fraction,
+            config.min_oocyte_area_fraction,
+        )
+
     index = load_tile_index(
         tile_sizes=(config.tile_size,),
         label_rule=config.label_rule,
-        min_oocyte_area_fraction=config.min_oocyte_area_fraction,
+        min_oocyte_area_fraction=scoring_area_fraction,
     )
     ambiguous = _ambiguous_counts(index)
     scored = training_rows(index)
@@ -199,14 +274,30 @@ def evaluate(
     else:
         threshold, selection = float(decision_threshold), "caller_supplied"
 
-    metrics: dict[str, Any] = {"train": _train_summary(scored, config)}
+    # Under a rescoring `scored` is labelled at the scoring threshold, which is not the
+    # set the model trained on -- tiles that were ambiguous at 0.25 re-enter as
+    # positives or negatives at 0.05. _train_summary exists to report only tiles the
+    # model actually met, so it gets its own index at the trained threshold.
+    if rescored:
+        trained_index = load_tile_index(
+            tile_sizes=(config.tile_size,),
+            label_rule=config.label_rule,
+            min_oocyte_area_fraction=config.min_oocyte_area_fraction,
+        )
+        train_summary = _train_summary(training_rows(trained_index), config)
+    else:
+        train_summary = _train_summary(scored, config)
+    metrics: dict[str, Any] = {"train": train_summary}
     for split, frame in scored_splits.items():
         metrics[split] = _split_metrics(
             frame, threshold, bootstrap_samples, config.seed
         )
     predictions = list(scored_splits.values())
 
-    predictions_path = run_path / "predictions.csv"
+    # A rescoring writes beside the run's own evaluation rather than over it: both are
+    # legitimate results for the same checkpoint and answer different questions.
+    suffix = _eval_suffix(scoring_area_fraction) if requested else ""
+    predictions_path = run_path / f"predictions{suffix}.csv"
     _write_predictions(predictions_path, pd.concat(predictions, ignore_index=True))
 
     results = _build_results(
@@ -220,12 +311,14 @@ def evaluate(
         run_path=run_path,
         checkpoint_path=checkpoint_path,
         predictions_path=predictions_path,
+        scoring_area_fraction=scoring_area_fraction,
+        rescored=rescored,
     )
     results = _nan_to_none(results)
     # Sanitise before returning, not only before writing: _nan_to_none builds a copy, so
     # returning the raw payload would let the caller print "nan" while results.json
     # correctly said null.
-    _write_results(run_path / "results.json", results)
+    _write_results(run_path / f"results{suffix}.json", results)
     return results
 
 
@@ -513,6 +606,8 @@ def _build_results(
     run_path: Path,
     checkpoint_path: Path,
     predictions_path: Path,
+    scoring_area_fraction: float,
+    rescored: bool,
 ) -> dict[str, Any]:
     """Assemble the results payload."""
     manifest_path = _resolve_repo_path(DEFAULT_SPLIT_MANIFEST)
@@ -530,6 +625,13 @@ def _build_results(
         "seed": config.seed,
         "label_rule": config.label_rule,
         "min_oocyte_area_fraction": config.min_oocyte_area_fraction,
+        # The labelling the metrics below were computed against. Equal to
+        # min_oocyte_area_fraction unless this is a rescoring -- kept as a separate key
+        # because collapsing them would make a model trained at 0.25 and scored at 0.05
+        # indistinguishable from one trained at 0.05, which is the whole point of the
+        # comparison this field exists to support.
+        "eval_min_oocyte_area_fraction": scoring_area_fraction,
+        "is_rescored": rescored,
         "n_ambiguous_excluded": ambiguous,
         "decision_threshold": decision_threshold,
         "threshold_selection": threshold_selection,
