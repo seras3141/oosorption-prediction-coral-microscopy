@@ -36,10 +36,20 @@ notebooks = [
     "ipywidgets>=8.0",
 ]
 ml = [
-    "torch>=2.3",
-    "torchvision>=0.18",
+    # Pinned, not floated. A re-resolve while adding transformers/timm silently moved
+    # torch 2.14 -> 2.12 and cuDNN 9.24 -> 9.20, after which every GPU convolution died
+    # with CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH on nodes that had worked before.
+    # 2.14 is the version verified end-to-end on an A100 here, so it is pinned to that
+    # minor rather than floored: a later minor re-pairs torch with a different bundled
+    # cuDNN and can reproduce the same failure.
+    "torch==2.14.*",
+    "torchvision==0.29.*",
     "ultralytics>=8.3",
     "torchstain>=1.4",
+    "scikit-learn>=1.5",
+    "transformers>=4.44",
+    "timm>=1.0",
+    "huggingface-hub>=0.24",
 ]
 sharepoint = [
     "msal>=1.28",
@@ -53,6 +63,16 @@ coral-geojson-to-yolo = "scripts.geojson_to_yolo:main"
 coral-extract-rois = "scripts.extract_ndpi_rois:main"
 coral-download-geojson = "scripts.download_geojson:main"
 coral-verify-tile-labels = "scripts.verify_tile_labels:main"
+coral-train-tile-classifier = "scripts.train_tile_classifier:main"
+coral-evaluate-tile-classifier = "scripts.evaluate_tile_classifier:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/data_preparation", "src/modeling", "scripts"]
+
+[tool.pytest.ini_options]
+# Without testpaths, a bare `pytest` recurses from the repo root and stats every file
+# under data/ looking for test_*.py -- roughly 975,000 tile PNGs on a Lustre filesystem.
+# That walk, not the tests, was ~98% of a 2h36m suite run; naming the directory takes it
+# back to minutes. norecursedirs is belt-and-braces for anyone who passes another path.
+testpaths = ["tests"]
+norecursedirs = ["data", "docs_hpc", "docs_local", "slurm", ".venv", ".git", "notebooks"]
