@@ -462,16 +462,30 @@ def train(config: TrainingConfig) -> TrainingResult:
     # improving epoch, and pre-deleting it would mean a re-run killed early -- a
     # preempted GPU job, or a failure inside prepare_splits -- left the directory with
     # no checkpoint at all, destroying a result that was still scoreable.
-    for stale in (
-        composition_log,
-        run_log_path,
-        # Globbed, not named: an evaluation run with --eval-min-oocyte-area-fraction
-        # writes results_eval_area<bp>.json beside these, and a literal list would leave
-        # a previous checkpoint's rescoring in place, indistinguishable from a fresh one.
-        *run_dir.glob("results*.json"),
-        *run_dir.glob("predictions*.csv"),
-    ):
-        stale.unlink(missing_ok=True)
+    # batch_composition.jsonl is appended to per batch, so it has to start empty or this
+    # execution's records interleave with the previous one's. training_log.json is NOT
+    # cleared: it is written once with mode "w" at the end of the run, so truncating it
+    # up front overwrites nothing and only costs the previous run's log -- which a
+    # preempted re-run needs, because evaluating the preserved checkpoint without it
+    # falls back to null epochs_run and early_stopped.
+    composition_log.unlink(missing_ok=True)
+
+    # A job killed between mkstemp and os.replace leaves an orphan; the except
+    # clause cannot run on SIGKILL, which is the case this is written for.
+    for orphan in run_dir.glob("*.tmp"):
+        LOG.info("Removing orphaned %s from an interrupted checkpoint write", orphan.name)
+        orphan.unlink(missing_ok=True)
+
+    # The previous evaluation is NOT cleared here. It describes the checkpoint that is
+    # also still on disk, and deleting it up front would mean a re-run killed early left
+    # a checkpoint whose results, predictions and prediction log had all been removed --
+    # preserving the artifact while destroying what makes it interpretable. They are
+    # purged instead on the first improving epoch, once a replacement checkpoint exists
+    # (see _purge_superseded_evaluations).
+
+    # Set once the first checkpoint of this run lands; until then the directory still
+    # holds the previous run's checkpoint and its matching evaluation.
+    superseded_purged = False
 
     splits = prepare_splits(config)
     input_px = input_px_for(config)
@@ -587,6 +601,11 @@ def train(config: TrainingConfig) -> TrainingResult:
                 _checkpoint_payload(model, config, epoch, average_precision),
                 checkpoint_path,
             )
+            if not superseded_purged:
+                # The checkpoint on disk is now this run's, so any evaluation left by the
+                # previous one describes a model that no longer exists here.
+                _purge_superseded_evaluations(run_dir)
+                superseded_purged = True
         else:
             epochs_without_gain += 1
             if epochs_without_gain >= config.patience:
@@ -694,6 +713,34 @@ def _check_mining_configuration(config: TrainingConfig) -> None:
         )
 
 
+def _purge_superseded_evaluations(run_dir: Path) -> None:
+    """Remove evaluations of the checkpoint this run has just replaced.
+
+    Globbed rather than named: an evaluation run with --eval-min-oocyte-area-fraction
+    writes results_eval_area<bp>.json and predictions_eval_area<bp>.csv beside the
+    native pair, and a literal list would leave a previous checkpoint's rescoring in
+    place, indistinguishable from a fresh one.
+
+    Called only after a replacement checkpoint has been written, so a run that dies
+    before its first improving epoch leaves the previous checkpoint and its evaluation
+    intact together.
+    """
+    for stale in (*run_dir.glob("results*.json"), *run_dir.glob("predictions*.csv")):
+        LOG.info("Removing %s; it describes the checkpoint this run replaced", stale.name)
+        stale.unlink(missing_ok=True)
+
+
+def _current_umask() -> int:
+    """Read the process umask without leaving it changed.
+
+    os.umask both sets and returns, so the only way to read it is to set it and put it
+    back. Honouring it matters here because the checkpoint mode is being set explicitly.
+    """
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
 def _save_checkpoint_atomically(payload: dict[str, Any], path: Path) -> None:
     """Write the checkpoint to a sibling temp file, then replace in one step.
 
@@ -709,6 +756,10 @@ def _save_checkpoint_atomically(payload: dict[str, Any], path: Path) -> None:
     temp_path = Path(temp_name)
     try:
         torch.save(payload, temp_path)
+        # mkstemp creates 0600 and os.replace preserves it, so without this the
+        # checkpoint lands unreadable to the group on the shared lustre tree -- an
+        # access regression the previous in-place torch.save did not have.
+        temp_path.chmod(0o644 & ~_current_umask())
         os.replace(temp_path, path)
     except BaseException:
         temp_path.unlink(missing_ok=True)

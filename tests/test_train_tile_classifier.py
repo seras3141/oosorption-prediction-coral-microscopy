@@ -559,3 +559,61 @@ def test_evaluation_does_not_request_pretrained_weights() -> None:
 
     assert not torch.allclose(trained.conv1.weight, restored.conv1.weight)
     assert trained.fc.out_features == restored.fc.out_features == 1
+
+
+def test_a_previous_evaluation_survives_a_run_that_dies_before_checkpointing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A re-run killed early must leave the old checkpoint AND its evaluation.
+
+    The checkpoint is deliberately preserved so a preempted job still leaves something
+    scoreable. Deleting its results up front kept the artifact while destroying what
+    makes it interpretable, so the purge is deferred until a replacement exists.
+
+    Driven through train() with a failure injected where a preempted job would hit one,
+    rather than by asserting on files the test itself wrote.
+    """
+    import src.modeling.train_tile_classifier as mod
+
+    config = TrainingConfig(architecture="resnet18", tile_size=512,
+                            output_dir=str(tmp_path))
+    run_dir = tmp_path / config.run_id()
+    run_dir.mkdir(parents=True)
+    for name in ("checkpoint.pt", "results.json", "predictions.csv",
+                 "results_eval_area0500.json", "predictions_eval_area2500.csv"):
+        (run_dir / name).write_text("from the previous run")
+
+    def _preempted(_config):
+        raise RuntimeError("simulating a job killed during split preparation")
+
+    # build_model runs before prepare_splits and pulls ImageNet weights, which the
+    # no-egress compute nodes this milestone targets cannot fetch -- the test would fail
+    # on a download error rather than the failure it is actually asserting.
+    monkeypatch.setattr(mod, "build_model", lambda *a, **k: torch.nn.Linear(1, 1))
+    monkeypatch.setattr(mod, "prepare_splits", _preempted)
+    with pytest.raises(RuntimeError, match="simulating"):
+        mod.train(config)
+
+    assert (run_dir / "checkpoint.pt").read_text() == "from the previous run"
+    for name in ("results.json", "predictions.csv",
+                 "results_eval_area0500.json", "predictions_eval_area2500.csv"):
+        assert (run_dir / name).exists(), f"{name} was deleted before a replacement existed"
+
+
+def test_a_replacement_checkpoint_purges_every_evaluation_of_the_old_one(
+    tmp_path: Path,
+) -> None:
+    """Including rescorings, which a literal filename list would leave behind."""
+    from src.modeling.train_tile_classifier import _purge_superseded_evaluations
+
+    (tmp_path / "checkpoint.pt").write_text("new")
+    for name in ("results.json", "predictions.csv",
+                 "results_eval_area0500.json", "predictions_eval_area2500.csv"):
+        (tmp_path / name).write_text("stale")
+
+    _purge_superseded_evaluations(tmp_path)
+
+    assert not list(tmp_path.glob("results*.json"))
+    assert not list(tmp_path.glob("predictions*.csv"))
+    # The checkpoint itself is this run's and must survive.
+    assert (tmp_path / "checkpoint.pt").read_text() == "new"

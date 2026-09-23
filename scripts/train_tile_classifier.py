@@ -37,6 +37,14 @@ def _positive_int(value: str) -> int:
     return number
 
 
+def _non_negative_int(value: str) -> int:
+    """Worker counts where 0 is meaningful but a negative is not."""
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"must be zero or greater, got {number}")
+    return number
+
+
 def _at_least_two(value: str) -> int:
     """Validation caps need room for one tile of each class."""
     number = int(value)
@@ -99,9 +107,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Frozen-encoder head width. Recorded with the run, because a head-only "
              "checkpoint stores exactly these layers.",
     )
-    parser.add_argument("--head-dropout", type=float, default=None)
+    parser.add_argument(
+        "--head-dropout", type=_unit_interval, default=None,
+        help="In (0, 1). 1.0 would zero the head's hidden layer outright, so the\n"
+             "logit collapses to a constant bias and a multi-hour run trains\n"
+             "something that cannot learn -- with the value baked into the run id.",
+    )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--num-workers", type=_non_negative_int, default=4,
+        help="0 loads in the main process. A negative value would otherwise fail\n"
+             "inside DataLoader, after the backbone and the whole tile index have\n"
+             "already been loaded.",
+    )
     parser.add_argument(
         "--max-train-slides", type=_positive_int, default=None,
         help="Smoke tests only: cap the number of train slides indexed.",

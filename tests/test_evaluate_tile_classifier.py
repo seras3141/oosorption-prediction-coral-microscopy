@@ -453,19 +453,61 @@ def test_threshold_candidates_come_from_the_observed_probabilities() -> None:
     assert f1_score(targets, (probs >= threshold).astype(int)) == pytest.approx(1.0)
 
 
-def test_threshold_selection_is_capped_on_a_large_split() -> None:
-    """Candidates track the predictions, but the search stays bounded."""
-    from src.modeling.evaluate_tile_classifier import MAX_THRESHOLD_CANDIDATES
+def test_threshold_selection_matches_brute_force_on_a_large_split() -> None:
+    """The sweep must find the true maximum, not an approximation of it.
+
+    The previous implementation subsampled candidates to 512 quantiles once a split
+    exceeded that; the real validation split carries 7,431 distinct probabilities, so
+    most actual cut points were never scored while the results still recorded the
+    selection as an exact validation maximum.
+    """
+    from sklearn.metrics import f1_score
 
     rng = np.random.default_rng(0)
-    targets = (rng.random(5000) < 0.2).astype(int)
-    probs = np.clip(targets * 0.3 + rng.normal(0.4, 0.15, 5000), 0.0, 1.0)
+    n = 3000
+    targets = rng.integers(0, 2, n)
+    # Overlapping class-conditional scores, so the optimum is interior rather than at
+    # a trivially separable edge.
+    probs = np.clip(rng.normal(0.35 + 0.3 * targets, 0.18), 0.0, 1.0)
+    assert len(np.unique(probs)) > 512, "fixture must exceed the old cap to be a test"
 
-    threshold, how = select_threshold(targets, probs)
-
+    chosen, how = select_threshold(targets, probs)
     assert how == "max_val_f1"
-    assert 0.0 <= threshold <= 1.0
-    assert len(np.unique(probs)) > MAX_THRESHOLD_CANDIDATES
+
+    best_possible = max(
+        f1_score(targets, (probs >= t).astype(int), zero_division=0)
+        for t in np.unique(probs)
+    )
+    achieved = f1_score(targets, (probs >= chosen).astype(int), zero_division=0)
+    assert achieved == pytest.approx(best_possible)
+
+
+def test_selected_threshold_is_an_observed_probability() -> None:
+    """A cut between two observed scores classifies identically to the lower one.
+
+    Returning an interpolated value would record an operating point that no tile
+    actually sits on, which a verifier re-deriving metrics could not reproduce.
+    """
+    rng = np.random.default_rng(1)
+    targets = rng.integers(0, 2, 400)
+    probs = np.round(rng.random(400), 3)
+
+    chosen, _ = select_threshold(targets, probs)
+    assert chosen in set(probs.tolist())
+
+
+def test_ties_resolve_to_the_lower_threshold() -> None:
+    """Favours recall: missing an oocyte is the costlier error for a screening stage.
+
+    Cuts at 0.3 and 0.9 both score F1 0.6667 here, and nothing but the tie rule
+    separates them -- an argmax over the descending candidates returns 0.9. A fixture
+    with a unique maximum would pass under either rule and prove nothing.
+    """
+    targets = np.array([1, 0, 0, 1, 0])
+    probabilities = np.array([0.9, 0.7, 0.5, 0.3, 0.1])
+
+    chosen, _ = select_threshold(targets, probabilities)
+    assert chosen == pytest.approx(0.3)
 
 
 def test_bootstrap_samples_below_one_is_refused(tmp_path: Path) -> None:

@@ -75,9 +75,7 @@ DEFAULT_BOOTSTRAP_SAMPLES = 2000
 #: Only a fallback. The operating point is normally selected on validation; this is what
 #: is used when that selection cannot run, e.g. a single-class validation split.
 FALLBACK_DECISION_THRESHOLD = 0.5
-#: Cap on candidate thresholds considered during selection. Candidates come from the
-#: observed probabilities, so this only bounds the work on a large split.
-MAX_THRESHOLD_CANDIDATES = 512
+
 
 def specimen_of(stem: str) -> str:
     """The specimen a slide belongs to, which is the unit that is actually independent.
@@ -400,23 +398,43 @@ def select_threshold(targets: np.ndarray, probabilities: np.ndarray) -> tuple[fl
         )
         return FALLBACK_DECISION_THRESHOLD, "fallback_single_class"
 
-    # Candidates are the observed probabilities, not a fixed grid. F1 only changes
-    # where the cut crosses an actual prediction, so an evenly spaced grid can step
-    # straight over a narrow optimum: with one positive at 0.504 and one negative at
-    # 0.501, every point of a 199-step grid scores both the same way and the best F1
-    # found is 0.667, where cutting at 0.504 gives 1.0.
-    candidates = np.unique(probabilities)
-    if len(candidates) > MAX_THRESHOLD_CANDIDATES:
-        # Quantiles keep the candidates where the predictions actually are, which an
-        # evenly spaced grid does not.
-        candidates = np.unique(
-            np.quantile(candidates, np.linspace(0.0, 1.0, MAX_THRESHOLD_CANDIDATES))
-        )
-    scores = [f1_score(targets, (probabilities >= t).astype(int), zero_division=0)
-              for t in candidates]
-    best = int(np.argmax(scores))
+    # Every distinct observed probability is evaluated, by a cumulative sweep rather
+    # than one f1_score call per candidate. F1 only changes where the cut crosses an
+    # actual prediction, so a fixed grid can step over a narrow optimum -- with one
+    # positive at 0.504 and one negative at 0.501, a 199-step grid finds 0.667 where
+    # cutting at 0.504 gives 1.0. Subsampling the candidates has the same failure: the
+    # real validation split carries 7,431 distinct probabilities, so a 512-point
+    # quantile subset omitted most of the actual cut points while the results still
+    # recorded the selection as an exact maximum.
+    order = np.argsort(-probabilities, kind="stable")
+    sorted_probs = probabilities[order]
+    sorted_targets = targets[order].astype(np.int64)
+
+    # At a cut of sorted_probs[i], everything up to and including i is predicted
+    # positive, so the running sums give TP and FP directly.
+    true_positives = np.cumsum(sorted_targets)
+    false_positives = np.cumsum(1 - sorted_targets)
+
+    # One candidate per distinct probability: the last index of each run of equal
+    # values, since a cut inside a tie would split identical predictions.
+    last_of_run = np.flatnonzero(np.diff(sorted_probs)) if len(sorted_probs) > 1 else []
+    ends = np.append(last_of_run, len(sorted_probs) - 1).astype(np.int64)
+
+    candidates = sorted_probs[ends]
+    tp = true_positives[ends]
+    fp = false_positives[ends]
+    fn = int(sorted_targets.sum()) - tp
+    denominator = 2 * tp + fp + fn
+    scores = np.divide(
+        2 * tp, denominator, out=np.zeros(len(ends), dtype=float), where=denominator > 0
+    )
+
+    # Ties go to the lower threshold, which favours recall -- missing an oocyte is the
+    # costlier error for a screening stage feeding detection. `candidates` descends, so
+    # the lowest tied threshold is the last maximum, not the first.
+    best = len(scores) - 1 - int(np.argmax(scores[::-1]))
     LOG.info(
-        "Validation-selected threshold %.6f (F1 %.4f) from %d candidates; "
+        "Validation-selected threshold %.6f (F1 %.4f) from %d distinct probabilities; "
         "0.50 would give F1 %.4f",
         candidates[best],
         scores[best],
