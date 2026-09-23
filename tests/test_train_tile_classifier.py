@@ -580,7 +580,8 @@ def test_a_previous_evaluation_survives_a_run_that_dies_before_checkpointing(
     run_dir = tmp_path / config.run_id()
     run_dir.mkdir(parents=True)
     for name in ("checkpoint.pt", "results.json", "predictions.csv",
-                 "results_eval_area0500.json", "predictions_eval_area2500.csv"):
+                 "results_eval_area0500.json", "predictions_eval_area2500.csv",
+                 "batch_composition.jsonl", "training_log.json"):
         (run_dir / name).write_text("from the previous run")
 
     def _preempted(_config):
@@ -596,7 +597,11 @@ def test_a_previous_evaluation_survives_a_run_that_dies_before_checkpointing(
 
     assert (run_dir / "checkpoint.pt").read_text() == "from the previous run"
     for name in ("results.json", "predictions.csv",
-                 "results_eval_area0500.json", "predictions_eval_area2500.csv"):
+                 "results_eval_area0500.json", "predictions_eval_area2500.csv",
+                 # results.json records this path and the verification pass re-derives
+                 # the realised positive ratio from it, so a preserved evaluation
+                 # without it cannot be checked.
+                 "batch_composition.jsonl", "training_log.json"):
         assert (run_dir / name).exists(), f"{name} was deleted before a replacement existed"
 
 
@@ -607,13 +612,15 @@ def test_a_replacement_checkpoint_purges_every_evaluation_of_the_old_one(
     from src.modeling.train_tile_classifier import _purge_superseded_evaluations
 
     (tmp_path / "checkpoint.pt").write_text("new")
-    for name in ("results.json", "predictions.csv",
-                 "results_eval_area0500.json", "predictions_eval_area2500.csv"):
+    for name in ("results.json", "predictions.csv", "results_eval_area0500.json",
+                 "predictions_eval_area2500.csv", "batch_composition.jsonl"):
         (tmp_path / name).write_text("stale")
 
     _purge_superseded_evaluations(tmp_path)
 
     assert not list(tmp_path.glob("results*.json"))
     assert not list(tmp_path.glob("predictions*.csv"))
+    # The old ratio must not outlive the checkpoint it was measured on.
+    assert not (tmp_path / "batch_composition.jsonl").exists()
     # The checkpoint itself is this run's and must survive.
     assert (tmp_path / "checkpoint.pt").read_text() == "new"

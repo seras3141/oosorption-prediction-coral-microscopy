@@ -448,27 +448,27 @@ def train(config: TrainingConfig) -> TrainingResult:
     run_dir = _resolve_repo_path(config.output_dir) / config.run_id()
     run_dir.mkdir(parents=True, exist_ok=True)
     composition_log = run_dir / "batch_composition.jsonl"
-    # The sampler appends, and run_dir is deterministic, so a re-run of the same
-    # configuration would interleave two runs' batch records in the one file the
-    # verification pass reads the realised ratio from.
+    # Staged, not written in place. run_dir is deterministic, so a re-run of the same
+    # configuration shares it with the previous execution, and every derived artifact
+    # in there -- results, predictions, training log, composition log -- describes the
+    # checkpoint that produced it. The directory must therefore describe the previous
+    # run or this one, never a mix of both.
+    #
+    # So this run appends its batch records to a staging file and swaps it into place
+    # only once the run completes. A re-run that dies early leaves the previous run's
+    # checkpoint, evaluation and composition log intact and mutually consistent, which
+    # matters because results.json records batch_composition_log_path and the
+    # verification pass re-derives the realised positive ratio from exactly that file.
+    #
+    # checkpoint.pt is likewise not pre-deleted: it is replaced on the first improving
+    # epoch, and clearing it up front would leave a re-run killed early -- a preempted
+    # GPU job, or a failure inside prepare_splits -- with no checkpoint at all,
+    # destroying a result that was still scoreable. The previous run's derived
+    # artifacts are purged at that same moment, once a replacement exists.
+    composition_staging = run_dir / "batch_composition.partial.jsonl"
     checkpoint_path = run_dir / "checkpoint.pt"
     run_log_path = run_dir / "training_log.json"
-    # The run directory is deterministic, so a re-run of the same configuration would
-    # otherwise leave the previous execution's log and evaluation beside this one's
-    # partial composition log -- and anything reading the checkpoint would score a
-    # different execution than the logs describe.
-    #
-    # checkpoint.pt is deliberately NOT cleared. It is overwritten on the first
-    # improving epoch, and pre-deleting it would mean a re-run killed early -- a
-    # preempted GPU job, or a failure inside prepare_splits -- left the directory with
-    # no checkpoint at all, destroying a result that was still scoreable.
-    # batch_composition.jsonl is appended to per batch, so it has to start empty or this
-    # execution's records interleave with the previous one's. training_log.json is NOT
-    # cleared: it is written once with mode "w" at the end of the run, so truncating it
-    # up front overwrites nothing and only costs the previous run's log -- which a
-    # preempted re-run needs, because evaluating the preserved checkpoint without it
-    # falls back to null epochs_run and early_stopped.
-    composition_log.unlink(missing_ok=True)
+    composition_staging.unlink(missing_ok=True)
 
     # A job killed between mkstemp and os.replace leaves an orphan; the except
     # clause cannot run on SIGKILL, which is the case this is written for.
@@ -515,7 +515,7 @@ def train(config: TrainingConfig) -> TrainingResult:
         positive_fraction=config.positive_fraction,
         batches_per_epoch=config.max_batches_per_epoch,
         seed=config.seed,
-        composition_log_path=composition_log,
+        composition_log_path=composition_staging,
         label_rule=config.label_rule,
     )
     train_loader = DataLoader(
@@ -625,6 +625,10 @@ def train(config: TrainingConfig) -> TrainingResult:
             "positives and negatives at this tile size and threshold."
         )
 
+    # The run finished, so its batch records become the directory's canonical ones.
+    if composition_staging.exists():
+        os.replace(composition_staging, composition_log)
+
     result = TrainingResult(
         run_id=config.run_id(),
         config=asdict(config),
@@ -725,7 +729,16 @@ def _purge_superseded_evaluations(run_dir: Path) -> None:
     before its first improving epoch leaves the previous checkpoint and its evaluation
     intact together.
     """
-    for stale in (*run_dir.glob("results*.json"), *run_dir.glob("predictions*.csv")):
+    superseded = [
+        *run_dir.glob("results*.json"),
+        *run_dir.glob("predictions*.csv"),
+        # The previous run's batch records. This run's are staged elsewhere and swap in
+        # at the end, so leaving this would pair a new checkpoint with an old ratio.
+        run_dir / "batch_composition.jsonl",
+    ]
+    for stale in superseded:
+        if not stale.exists():
+            continue
         LOG.info("Removing %s; it describes the checkpoint this run replaced", stale.name)
         stale.unlink(missing_ok=True)
 
