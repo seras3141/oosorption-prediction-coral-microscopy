@@ -735,6 +735,12 @@ def _purge_superseded_evaluations(run_dir: Path) -> None:
         # The previous run's batch records. This run's are staged elsewhere and swap in
         # at the end, so leaving this would pair a new checkpoint with an old ratio.
         run_dir / "batch_composition.jsonl",
+        # Likewise checkpoint-derived: it carries epochs_run, best_epoch and
+        # early_stopped. Left in place, a re-run that dies after this point would pair
+        # its new checkpoint with the previous run's epoch counts, and the evaluator
+        # would report them as this run's. Absent, _epoch_summary falls back to nulls
+        # and says so, which is the honest failure.
+        run_dir / "training_log.json",
     ]
     for stale in superseded:
         if not stale.exists():
@@ -935,9 +941,23 @@ def _write_run_log(path: Path, result: TrainingResult) -> None:
     be computed -- so any strict consumer would reject the file.
     """
     payload = _nan_to_none(asdict(result))
-    with path.open("w", encoding="utf-8") as fp:
-        json.dump(payload, fp, indent=2, allow_nan=False)
-        fp.write("\n")
+    # Staged and replaced, like the checkpoint: this file is part of the evaluator's
+    # metadata contract, and truncating it in place means a preemption during the write
+    # leaves invalid JSON that the next evaluation dies on, rather than either a
+    # complete log or none at all.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temp_name = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    os.close(handle)
+    temp_path = Path(temp_name)
+    try:
+        with temp_path.open("w", encoding="utf-8") as fp:
+            json.dump(payload, fp, indent=2, allow_nan=False)
+            fp.write("\n")
+        temp_path.chmod(0o644 & ~_current_umask())
+        os.replace(temp_path, path)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
     LOG.info("Wrote %s", path)
 
 

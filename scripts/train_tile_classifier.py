@@ -68,6 +68,20 @@ def _unit_interval(value: str) -> float:
     return number
 
 
+def _upper_inclusive_unit(value: str) -> float:
+    """A proportion in (0, 1], for the mining options.
+
+    Separate from _unit_interval because the sampler accepts a pool fraction of 1.0 --
+    mine over every negative -- and a hard-negative share of 1.0 -- fill the whole
+    negative quota from the hard pool. Rejecting those at the CLI made two legitimate
+    configurations unreachable from the command line while the library allowed them.
+    """
+    number = float(value)
+    if not 0.0 < number <= 1.0:
+        raise argparse.ArgumentTypeError(f"must be in (0, 1], got {number}")
+    return number
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--architecture", choices=ARCHITECTURES, default="resnet18")
@@ -100,8 +114,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Refused under the centroid label rule, which it would train on the noise of.",
     )
     parser.add_argument("--warmup-epochs", type=_positive_int, default=3)
-    parser.add_argument("--hard-negative-pool-fraction", type=_unit_interval, default=0.25)
-    parser.add_argument("--hard-negative-share", type=_unit_interval, default=0.5)
+    parser.add_argument(
+        "--hard-negative-pool-fraction", type=_upper_inclusive_unit, default=0.25,
+        help="In (0, 1]; 1.0 mines over every negative.",
+    )
+    parser.add_argument(
+        "--hard-negative-share", type=_upper_inclusive_unit, default=0.5,
+        help="In (0, 1]; 1.0 fills the whole negative quota from the hard pool.",
+    )
     parser.add_argument(
         "--head-hidden-dim", type=_positive_int, default=None,
         help="Frozen-encoder head width. Recorded with the run, because a head-only "

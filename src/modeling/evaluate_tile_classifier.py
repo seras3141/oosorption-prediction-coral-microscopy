@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import logging
 from pathlib import Path
 from typing import Any
@@ -181,6 +182,16 @@ def evaluate(
         raise ValueError(
             f"bootstrap_samples must be at least 1, got {bootstrap_samples}; zero would "
             "complete with every confidence interval null while recording the count"
+        )
+    if decision_threshold is not None and not (
+        math.isfinite(decision_threshold) and 0.0 < decision_threshold < 1.0
+    ):
+        # The CLI enforces this, but evaluate() is also called directly -- from the
+        # notebook and from tests -- and an out-of-range or NaN cut scores every tile
+        # one way while the results still record it as a deliberate operating point.
+        raise ValueError(
+            f"decision_threshold must be a finite value in (0, 1), got "
+            f"{decision_threshold}"
         )
     if eval_min_oocyte_area_fraction is not None:
         if not 0.0 < eval_min_oocyte_area_fraction < 1.0:
@@ -450,7 +461,12 @@ def _split_metrics(
     bootstrap_samples: int,
     seed: int,
 ) -> dict[str, Any]:
-    """Point metrics plus slide-clustered confidence intervals for one split."""
+    """Point metrics plus specimen-clustered confidence intervals for one split.
+
+    Specimen, not slide: _bootstrap_intervals resamples the unit that is actually
+    independent, and this description defines the independence contract the reported
+    intervals rest on.
+    """
     targets = binary_targets(frame).to_numpy()
     probabilities = frame["prob"].to_numpy()
     point = _point_metrics(targets, probabilities, threshold)

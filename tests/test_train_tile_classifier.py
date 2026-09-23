@@ -214,7 +214,12 @@ def test_frozen_arm_input_size_keeps_sub_tiles_at_the_backbone_magnification() -
 
 
 def test_resnet18_head_is_a_single_logit() -> None:
-    model = build_model(TrainingConfig())
+    """pretrained=False: the head's shape does not depend on the backbone's weights.
+
+    Loading them made this the slowest test in the suite and tied it to a warm cache or
+    network egress, which the compute nodes this milestone targets do not have.
+    """
+    model = build_model(TrainingConfig(), pretrained=False)
     assert model.fc.out_features == 1
 
 
