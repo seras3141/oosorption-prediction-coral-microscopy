@@ -34,6 +34,13 @@ notebooks = [
     "jupyterlab>=4.0",
     "ipykernel>=6.0",
     "ipywidgets>=8.0",
+    # Headless execution, so a notebook that is a verification gate can run in a batch
+    # job rather than only against a live server someone has to keep up.
+    "nbclient>=0.10",
+    # Real-time collaboration, which serves /api/collaboration/session. An agent editing
+    # a notebook through the Jupyter MCP server goes through that endpoint, and without
+    # this the server starts fine, lists files fine, and then 404s on every cell write.
+    "jupyter-collaboration>=4.0",
 ]
 ml = [
     # Pinned, not floated. A re-resolve while adding transformers/timm silently moved
