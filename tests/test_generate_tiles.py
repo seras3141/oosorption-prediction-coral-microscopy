@@ -7,12 +7,14 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 import tifffile
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from src.data_preparation import generate_tiles
 from src.data_preparation.extract_ndpi_cuts import create_tissue_mask
 from src.data_preparation.generate_tiles import (
     _assign_annotations_to_tile,
@@ -22,6 +24,24 @@ from src.data_preparation.generate_tiles import (
     _to_tile_local_coords,
     generate_tiles_for_cut,
 )
+
+
+@pytest.fixture
+def repo_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the module's repo root at pytest's temporary directory.
+
+    These tests cannot simply write into ``tmp_path``: ``generate_tiles_for_cut`` records
+    each tile's ``png_path`` through ``_path_relative_to_repo``, which calls
+    ``Path.relative_to(REPO_ROOT)`` and raises for any path outside it. The previous way
+    round that was to write into ``tmp_test_tiles/`` under the real repository root, which
+    left a directory behind in the working tree after every run and would collide between
+    concurrent runs.
+
+    Moving the root instead keeps the repo-relative path behaviour under test exactly as
+    it behaves in production, while confining the output to a directory pytest cleans up.
+    """
+    monkeypatch.setattr(generate_tiles, "REPO_ROOT", tmp_path)
+    return tmp_path
 
 
 def _annotation(annotation_id: str, coords: list[list[float]]) -> dict:
@@ -134,11 +154,11 @@ def test_extract_stage_absent() -> None:
     assert _extract_stage(feature) == "Unknown"
 
 
-def test_generate_tiles_for_cut_synthetic(tmp_path: Path) -> None:
+def test_generate_tiles_for_cut_synthetic(tmp_path: Path, repo_root: Path) -> None:
     cut_tiff_path = tmp_path / "TEST_slide_cut000.tif"
     annotations_geojson_path = tmp_path / "TEST_slide_cut000_annotations.geojson"
     cuts_manifest_path = tmp_path / "TEST_slide_cuts.json"
-    output_dir = Path("tmp_test_tiles") / tmp_path.name
+    output_dir = Path("tiles")
 
     arr = np.full((512, 512, 3), fill_value=[200, 150, 180], dtype=np.uint8)
     tifffile.imwrite(cut_tiff_path, arr)
@@ -178,11 +198,14 @@ def test_generate_tiles_for_cut_synthetic(tmp_path: Path) -> None:
         min_tissue_fraction=0.0,
     )
 
-    manifest_path = REPO_ROOT / output_dir / "TEST_slide" / "TEST_slide_cut000" / "TEST_slide_cut000_tile_manifest.json"
+    manifest_path = (
+        repo_root / output_dir / "TEST_slide" / "TEST_slide_cut000"
+        / "TEST_slide_cut000_tile_manifest.json"
+    )
     assert manifest_path.exists()
     assert manifest["n_tiles_total"] == len(manifest["tiles"])
     assert manifest["n_tiles_with_oocyte"] >= 1
-    assert all((REPO_ROOT / tile["png_path"]).exists() for tile in manifest["tiles"])
+    assert all((repo_root / tile["png_path"]).exists() for tile in manifest["tiles"])
 
     first_tile = next(tile for tile in manifest["tiles"] if tile["row"] == 0 and tile["col"] == 0)
     assert first_tile["annotations"][0]["annotation_id"] == "inside-first-tile"
@@ -190,11 +213,11 @@ def test_generate_tiles_for_cut_synthetic(tmp_path: Path) -> None:
     assert first_tile["annotations"][0]["tile_local_coords"][0] == [40.0, 40.0]
 
 
-def test_skip_if_exists(tmp_path: Path) -> None:
+def test_skip_if_exists(tmp_path: Path, repo_root: Path) -> None:
     cut_tiff_path = tmp_path / "TEST_slide_cut000.tif"
     annotations_geojson_path = tmp_path / "TEST_slide_cut000_annotations.geojson"
     cuts_manifest_path = tmp_path / "TEST_slide_cuts.json"
-    output_dir = Path("tmp_test_tiles") / tmp_path.name
+    output_dir = Path("tiles")
 
     arr = np.full((512, 512, 3), fill_value=[200, 150, 180], dtype=np.uint8)
     tifffile.imwrite(cut_tiff_path, arr)
@@ -215,7 +238,10 @@ def test_skip_if_exists(tmp_path: Path) -> None:
         tile_sizes=(256,),
         min_tissue_fraction=0.0,
     )
-    manifest_path = REPO_ROOT / output_dir / "TEST_slide" / "TEST_slide_cut000" / "TEST_slide_cut000_tile_manifest.json"
+    manifest_path = (
+        repo_root / output_dir / "TEST_slide" / "TEST_slide_cut000"
+        / "TEST_slide_cut000_tile_manifest.json"
+    )
     before_mtime = manifest_path.stat().st_mtime_ns
 
     second_manifest = generate_tiles_for_cut(

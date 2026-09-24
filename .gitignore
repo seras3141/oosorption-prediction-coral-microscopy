@@ -20,10 +20,6 @@ data/
 slurm/
 uv.lock
 
-# Local scratch / dev artefacts
-tmp_test_tiles/
-example_usage.py
-
 # JupyterLab server state, written into the working tree when a notebook is opened.
 # The ystore holds the real-time-collaboration CRDT history and grows without bound;
 # none of these describe the project.
