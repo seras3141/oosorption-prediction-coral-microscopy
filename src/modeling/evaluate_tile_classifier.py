@@ -46,6 +46,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from src.modeling.encoders import DEFAULT_ENCODER, encoder_spec, load_encoder
+# Also imported from here by the M7a notebook and tests, so the name stays available.
+from src.modeling.specimen_groups import specimen_of
 from src.modeling.tile_classification_dataset import TileClassificationDataset
 from src.modeling.tile_index import (
     LABEL_AMBIGUOUS,
@@ -70,29 +72,11 @@ from src.modeling.train_tile_classifier import (
 LOG = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-DEFAULT_SPLIT_MANIFEST = "data/splits/split_manifest.json"
 EVALUATION_SPLITS = ("val", "test")
 DEFAULT_BOOTSTRAP_SAMPLES = 2000
 #: Only a fallback. The operating point is normally selected on validation; this is what
 #: is used when that selection cannot run, e.g. a single-class validation split.
 FALLBACK_DECISION_THRESHOLD = 0.5
-
-
-def specimen_of(stem: str) -> str:
-    """The specimen a slide belongs to, which is the unit that is actually independent.
-
-    Slide stems are ``Site_Season_PolypNo_cutrange`` and one specimen -- a single polyp --
-    spans several cut ranges, so dropping the last component groups serial sections of the
-    same polyp together. `CHN_SP_5_22-24` and `CHN_SP_5_25-27` are consecutive sections
-    through one polyp, not two independent samples.
-
-    Examples
-    --------
-    >>> specimen_of("CHN_SP_5_22-24")
-    'CHN_SP_5'
-    """
-    parts = stem.split("_")
-    return "_".join(parts[:-1]) if len(parts) > 1 else stem
 
 
 PREDICTION_COLUMNS = (
@@ -264,6 +248,7 @@ def evaluate(
         )
 
     index = load_tile_index(
+        split_manifest_path=config.split_manifest_path,
         tile_sizes=(config.tile_size,),
         label_rule=config.label_rule,
         min_oocyte_area_fraction=scoring_area_fraction,
@@ -297,6 +282,7 @@ def evaluate(
     # model actually met, so it gets its own index at the trained threshold.
     if rescored:
         trained_index = load_tile_index(
+            split_manifest_path=config.split_manifest_path,
             tile_sizes=(config.tile_size,),
             label_rule=config.label_rule,
             min_oocyte_area_fraction=config.min_oocyte_area_fraction,
@@ -652,7 +638,10 @@ def _build_results(
     rescored: bool,
 ) -> dict[str, Any]:
     """Assemble the results payload."""
-    manifest_path = _resolve_repo_path(DEFAULT_SPLIT_MANIFEST)
+    # The manifest the run was trained and scored against, not the v1 default: under
+    # cross-validation every fold has its own, and hashing the default would record
+    # provenance for a split the numbers never came from.
+    manifest_path = _resolve_repo_path(config.split_manifest_path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     return {
         "run_id": config.run_id(),

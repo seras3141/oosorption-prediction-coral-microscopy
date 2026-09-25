@@ -629,3 +629,123 @@ def test_a_replacement_checkpoint_purges_every_evaluation_of_the_old_one(
     assert not (tmp_path / "batch_composition.jsonl").exists()
     # The checkpoint itself is this run's and must survive.
     assert (tmp_path / "checkpoint.pt").read_text() == "new"
+
+
+#: The six M7a Step 9 runs, as their training logs record them. Their run directories
+#: are named by these ids, so a change to the fingerprint must not move any of them.
+_M7A_BASE = dict(
+    batch_size=64, epochs=30, hard_negative_mining=True, hard_negative_pool_fraction=0.25,
+    hard_negative_share=0.5, head_dropout=0.25, head_hidden_dim=512, label_rule="area",
+    max_batches_per_epoch=None, max_train_slides=None, max_val_tiles=None, num_workers=7,
+    output_dir="data/tile_classifier", patience=5, positive_fraction=0.25, seed=42,
+    warmup_epochs=3, weight_decay=0.0001,
+)
+_PHIKON = dict(architecture="frozen_encoder", encoder_name="owkin/phikon-v2", lr=0.001)
+_RESNET = dict(architecture="resnet18", encoder_name=None, lr=0.0001)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "run_id"),
+    [
+        ({**_PHIKON, "tile_size": 512, "min_oocyte_area_fraction": 0.05},
+         "frozen_encoder_owkin-phikon-v2_0512_area0500_seed42_b6d474e8"),
+        ({**_PHIKON, "tile_size": 512, "min_oocyte_area_fraction": 0.1},
+         "frozen_encoder_owkin-phikon-v2_0512_area1000_seed42_7bb84bd0"),
+        ({**_PHIKON, "tile_size": 512, "min_oocyte_area_fraction": 0.25},
+         "frozen_encoder_owkin-phikon-v2_0512_area2500_seed42_91761463"),
+        ({**_PHIKON, "tile_size": 1024, "min_oocyte_area_fraction": 0.05},
+         "frozen_encoder_owkin-phikon-v2_1024_area0500_seed42_130c125a"),
+        ({**_RESNET, "tile_size": 512, "min_oocyte_area_fraction": 0.05},
+         "resnet18_none_0512_area0500_seed42_25b07503"),
+        ({**_RESNET, "tile_size": 1024, "min_oocyte_area_fraction": 0.05},
+         "resnet18_none_1024_area0500_seed42_2c076a50"),
+    ],
+)
+def test_existing_run_ids_survive_the_split_manifest_field(overrides: dict, run_id: str) -> None:
+    assert TrainingConfig(**_M7A_BASE, **overrides).run_id() == run_id
+
+
+def test_a_different_split_manifest_is_a_different_run() -> None:
+    """Four folds of one configuration must land in four directories."""
+    ids = {
+        TrainingConfig(split_manifest_path=f"data/splits/cv-v1/fold{k}_split_manifest.json").run_id()
+        for k in range(1, 5)
+    }
+    assert len(ids) == 4
+    assert TrainingConfig().run_id() not in ids
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "./data/splits/split_manifest.json",
+        "data/splits/../splits/split_manifest.json",
+        str(REPO_ROOT / "data" / "splits" / "split_manifest.json"),
+    ],
+)
+def test_one_manifest_has_one_run_id_however_it_is_spelled(spelling: str) -> None:
+    config = TrainingConfig(split_manifest_path=spelling)
+    assert config.split_manifest_path == "data/splits/split_manifest.json"
+    assert config.run_id() == TrainingConfig().run_id()
+
+
+def test_prepare_splits_reads_the_configured_manifest(monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.modeling.train_tile_classifier as module
+
+    seen: dict = {}
+
+    def _fake_index(**kwargs):
+        seen.update(kwargs)
+        return pd.DataFrame({
+            "split": ["train", "val"], "is_ambiguous": [False, False],
+            "label": ["positive", "negative"], "stem": ["A_1_1-2", "B_1_1-2"],
+        })
+
+    monkeypatch.setattr(module, "load_tile_index", _fake_index)
+    module.prepare_splits(TrainingConfig(split_manifest_path="data/splits/cv-v1/fold2.json"))
+    assert seen["split_manifest_path"] == "data/splits/cv-v1/fold2.json"
+
+
+@pytest.mark.parametrize("size", [128, 256])
+def test_small_tile_sizes_are_accepted_on_the_command_line(size: int) -> None:
+    from scripts.train_tile_classifier import _parse_args
+
+    assert _parse_args(["--tile-size", str(size)]).tile_size == size
+
+
+def test_regenerating_a_manifest_in_place_gives_a_new_run(tmp_path: Path) -> None:
+    """Fold manifests are rewritten at fixed paths; a run on the new split must not reuse
+    the old split's directory and overwrite its checkpoint."""
+    manifest = tmp_path / "fold1_split_manifest.json"
+    manifest.write_text('{"slides": {"A_1_1-2": {"split": "train"}}}')
+    before = TrainingConfig(split_manifest_path=str(manifest))
+
+    manifest.write_text('{"slides": {"A_1_1-2": {"split": "test"}}}')
+    after = TrainingConfig(split_manifest_path=str(manifest))
+
+    assert before.split_manifest_sha256 != after.split_manifest_sha256
+    assert before.run_id() != after.run_id()
+
+
+def test_a_checkpoint_config_is_refused_once_its_manifest_changes(tmp_path: Path) -> None:
+    """Otherwise evaluation scores an old checkpoint against a split it never trained on,
+    and records the new file's hash as its provenance."""
+    from dataclasses import asdict
+
+    manifest = tmp_path / "fold1_split_manifest.json"
+    manifest.write_text('{"slides": {"A_1_1-2": {"split": "train"}}}')
+    saved = asdict(TrainingConfig(split_manifest_path=str(manifest)))
+    assert TrainingConfig(**saved).run_id() == TrainingConfig(split_manifest_path=str(manifest)).run_id()
+
+    manifest.write_text('{"slides": {"A_1_1-2": {"split": "test"}}}')
+    with pytest.raises(ValueError, match="has changed since this run was trained"):
+        TrainingConfig(**saved)
+
+    manifest.unlink()
+    with pytest.raises(ValueError, match="no longer exists"):
+        TrainingConfig(**saved)
+
+
+def test_the_v1_default_is_never_hashed_into_the_run_id() -> None:
+    """Every M7a run id was fingerprinted without a hash; binding one would move them."""
+    assert TrainingConfig().split_manifest_sha256 is None

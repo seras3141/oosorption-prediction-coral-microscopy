@@ -657,3 +657,34 @@ def test_the_override_is_refused_for_the_centroid_rule(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="centroid"):
         evaluate(tmp_path, eval_min_oocyte_area_fraction=0.25)
+
+
+def test_results_hash_the_manifest_the_run_used_not_the_default(tmp_path: Path) -> None:
+    """Under cross-validation each fold has its own manifest; recording the v1 hash for a
+    fold run would claim provenance for a split its numbers never came from."""
+    import hashlib
+    import json
+
+    from src.modeling.evaluate_tile_classifier import _build_results
+    from src.modeling.train_tile_classifier import TrainingConfig
+
+    manifest = tmp_path / "fold1_split_manifest.json"
+    manifest.write_text(json.dumps({"manifest_version": "cv-v1-fold1", "slides": {}}))
+    config = TrainingConfig(split_manifest_path=str(manifest))
+    results = _build_results(
+        config=config,
+        checkpoint={"epoch": 3},
+        metrics={},
+        ambiguous={"val": 0, "test": 0},
+        decision_threshold=0.5,
+        threshold_selection="validation_f1",
+        bootstrap_samples=10,
+        run_path=tmp_path,
+        checkpoint_path=tmp_path / "checkpoint.pt",
+        predictions_path=tmp_path / "predictions.csv",
+        scoring_area_fraction=0.05,
+        rescored=False,
+    )
+
+    assert results["split_manifest_version"] == "cv-v1-fold1"
+    assert results["split_manifest_sha256"] == hashlib.sha256(manifest.read_bytes()).hexdigest()

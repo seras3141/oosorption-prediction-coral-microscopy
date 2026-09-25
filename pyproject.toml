@@ -72,6 +72,7 @@ coral-download-geojson = "scripts.download_geojson:main"
 coral-verify-tile-labels = "scripts.verify_tile_labels:main"
 coral-train-tile-classifier = "scripts.train_tile_classifier:main"
 coral-evaluate-tile-classifier = "scripts.evaluate_tile_classifier:main"
+coral-generate-fold-manifest = "scripts.generate_fold_manifest:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/data_preparation", "src/modeling", "scripts"]

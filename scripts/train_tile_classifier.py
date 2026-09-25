@@ -21,7 +21,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.modeling.train_tile_classifier import ARCHITECTURES, TrainingConfig, train
 from src.modeling.encoders import DEFAULT_ENCODER, SUPPORTED_ENCODERS
-from src.modeling.tile_index import LABEL_RULES
+from src.modeling.tile_index import DEFAULT_SPLIT_MANIFEST, LABEL_RULES
 from src.modeling.tile_labels import DEFAULT_MIN_OOCYTE_AREA_FRACTION
 
 
@@ -90,8 +90,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Frozen-encoder arm only. Default: %s." % DEFAULT_ENCODER,
     )
     parser.add_argument(
-        "--tile-size", type=int, choices=(512, 1024), default=512,
-        help="One size per run: the dataset refuses a mixed index.",
+        "--tile-size", type=int, choices=(128, 256, 512, 1024), default=512,
+        help="One size per run: the dataset refuses a mixed index. The frozen-encoder "
+             "arm refuses 128.",
+    )
+    parser.add_argument(
+        "--split-manifest", default=DEFAULT_SPLIT_MANIFEST,
+        help="Slide-to-split manifest to train and validate against. Default: the v1 "
+             "slide-level split, %(default)s. Cross-validation passes one per fold.",
     )
     parser.add_argument("--label-rule", choices=LABEL_RULES, default="area")
     parser.add_argument(
@@ -198,6 +204,7 @@ def main(argv: list[str] | None = None) -> int:
         max_train_slides=args.max_train_slides,
         max_batches_per_epoch=args.max_batches_per_epoch,
         max_val_tiles=args.max_val_tiles,
+        split_manifest_path=args.split_manifest,
         output_dir=args.output_dir,
     )
     result = train(config)

@@ -49,6 +49,7 @@ from src.modeling.encoders import (
 from src.modeling.samplers import ForcedRatioBatchSampler, check_mining_allowed
 from src.modeling.tile_classification_dataset import TileClassificationDataset
 from src.modeling.tile_index import (
+    DEFAULT_SPLIT_MANIFEST,
     LABEL_RULE_AREA,
     LABEL_RULE_CENTROID,
     binary_targets,
@@ -114,6 +115,14 @@ class TrainingConfig:
     max_train_slides: int | None = None
     max_batches_per_epoch: int | None = None
     max_val_tiles: int | None = None
+    #: The slide-to-split manifest the run trains and validates against. The v1
+    #: slide-level split by default; a cross-validation run passes one per fold.
+    split_manifest_path: str = DEFAULT_SPLIT_MANIFEST
+    #: SHA-256 of that manifest's contents, filled in at construction. Left None to have
+    #: it computed; a config reloaded from a checkpoint carries the value it trained
+    #: under, and construction refuses it if the file has changed since -- see
+    #: __post_init__.
+    split_manifest_sha256: str | None = None
     output_dir: str = "data/tile_classifier"
 
     #: Fields that do not change a run's numbers and so stay out of its fingerprint.
@@ -124,6 +133,15 @@ class TrainingConfig:
     #: different worker counts follow different training trajectories, so they must not
     #: share a run id and overwrite each other.
     RUN_ID_EXCLUDED: ClassVar[tuple[str, ...]] = ("output_dir",)
+
+    #: Fields added after runs had already been fingerprinted, with the value those runs
+    #: implicitly used. At that value the field is left out of the fingerprint, so every
+    #: existing run id -- and the run directory it names -- stays what it was; any other
+    #: value changes the id, which is what keeps four folds in four directories.
+    RUN_ID_OMITTED_AT_DEFAULT: ClassVar[dict[str, Any]] = {
+        "split_manifest_path": DEFAULT_SPLIT_MANIFEST,
+        "split_manifest_sha256": None,
+    }
 
     def __post_init__(self) -> None:
         """Resolve defaults here so the recorded config describes what actually ran.
@@ -167,6 +185,51 @@ class TrainingConfig:
             # differing only in it train on identical labels and must not be filed as
             # separate experiments.
             self.min_oocyte_area_fraction = DEFAULT_MIN_OOCYTE_AREA_FRACTION
+        # One spelling per manifest: "./data/splits/x.json", an absolute path into the
+        # repository and "data/splits/x.json" name the same split, and would otherwise
+        # fingerprint as three experiments -- or, at the v1 default, push an existing
+        # run to a new id.
+        self.split_manifest_path = _path_relative_to_repo(
+            Path(os.path.normpath(self.split_manifest_path))
+        )
+        self._bind_split_manifest()
+
+    def _bind_split_manifest(self) -> None:
+        """Tie the config to the manifest's contents, not only to its path.
+
+        The fold manifests are regenerated in place, at fixed paths. Keyed on the path
+        alone, a run on a regenerated split would reuse the old split's run id and
+        directory and overwrite its checkpoint, and evaluating an old checkpoint would
+        score it against a split it never trained on while recording the new file's
+        hash as its provenance. Hashing the contents into the fingerprint gives a new
+        split a new run, and comparing against the hash a checkpoint carries refuses
+        the mismatched evaluation outright.
+
+        The v1 default is exempt and stays None: every existing run id was fingerprinted
+        without it, and v1 is pinned by its own golden test rather than regenerated.
+        """
+        if self.split_manifest_path == DEFAULT_SPLIT_MANIFEST:
+            self.split_manifest_sha256 = None
+            return
+        path = _resolve_repo_path(self.split_manifest_path)
+        if not path.exists():
+            if self.split_manifest_sha256 is not None:
+                raise ValueError(
+                    f"{self.split_manifest_path} no longer exists; this run was trained "
+                    f"against a manifest with sha256 {self.split_manifest_sha256}"
+                )
+            # Left unbound: nothing can train or evaluate against a missing manifest,
+            # and load_tile_index reports it where the cause is visible.
+            return
+        current = hashlib.sha256(path.read_bytes()).hexdigest()
+        if self.split_manifest_sha256 is not None and self.split_manifest_sha256 != current:
+            raise ValueError(
+                f"{self.split_manifest_path} has changed since this run was trained "
+                f"(sha256 {self.split_manifest_sha256[:12]} then, {current[:12]} now); "
+                "its checkpoint describes a different split. Regenerating a fold "
+                "manifest in place does not carry old runs with it."
+            )
+        self.split_manifest_sha256 = current
 
     def run_id(self) -> str:
         """Identify a run by everything that changes its numbers.
@@ -197,6 +260,10 @@ class TrainingConfig:
             key: value
             for key, value in sorted(asdict(self).items())
             if key not in self.RUN_ID_EXCLUDED
+            and not (
+                key in self.RUN_ID_OMITTED_AT_DEFAULT
+                and value == self.RUN_ID_OMITTED_AT_DEFAULT[key]
+            )
         }
         digest = hashlib.sha256(
             json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
@@ -351,6 +418,7 @@ def prepare_splits(config: TrainingConfig) -> dict[str, pd.DataFrame]:
     """
     index = training_rows(
         load_tile_index(
+            split_manifest_path=config.split_manifest_path,
             tile_sizes=(config.tile_size,),
             label_rule=config.label_rule,
             min_oocyte_area_fraction=config.min_oocyte_area_fraction,

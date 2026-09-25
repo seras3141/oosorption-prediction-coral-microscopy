@@ -137,13 +137,25 @@ def test_no_gradient_reaches_the_backbone() -> None:
     assert any(p.grad is not None for p in model.head.parameters())
 
 
-@pytest.mark.parametrize("tile_size", [128, 256, 2048, 0])
+@pytest.mark.parametrize("tile_size", [128, 2048, 0])
 def test_unsupported_tile_size_is_refused(tile_size: int) -> None:
-    with pytest.raises(ValueError, match="tile_size must be"):
+    """128 px in particular: resized to 224 it would reach the backbone at ~4x its
+    training magnification, which the plan rules out for this arm."""
+    with pytest.raises(ValueError, match="supports tile sizes"):
         _classifier(tile_size)
 
-    with pytest.raises(ValueError, match="tile_size must be"):
+    with pytest.raises(ValueError, match="supports tile sizes"):
         encoder_input_px(tile_size)
+
+
+def test_256_px_is_embedded_once_without_pooling() -> None:
+    """256 px is accepted off-magnification: resized straight to 224, like 512 px, and
+    never split into quadrants, which would make 128 px sub-tiles."""
+    model = _classifier(256)
+
+    assert encoder_input_px(256) == 224
+    assert model.pools_sub_tiles is False
+    assert model(torch.randn(2, 3, 224, 224)).shape == (2,)
 
 
 def test_input_px_keeps_sub_tiles_at_the_backbone_magnification() -> None:
@@ -231,8 +243,8 @@ def test_bad_tile_size_is_refused_before_any_weight_fetch(
         raise AssertionError("weights must not be fetched for a bad tile size")
 
     monkeypatch.setattr(module, "FrozenEncoderClassifier", _explode)
-    with pytest.raises(ValueError, match="tile_size must be"):
-        load_encoder(PHIKON_V2, tile_size=256)
+    with pytest.raises(ValueError, match="supports tile sizes"):
+        load_encoder(PHIKON_V2, tile_size=128)
 
 
 def test_cls_token_is_preferred_over_the_pooler() -> None:

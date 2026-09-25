@@ -268,6 +268,7 @@ def test_tile_index_does_not_require_torch() -> None:
         "    raise AssertionError('blocker is inert; the test proves nothing')\n"
         "import src.modeling.tile_index\n"
         "import src.modeling.tile_labels\n"
+        "import src.modeling.specimen_groups\n"
         "assert 'torch' not in sys.modules, 'torch was imported'\n"
         "print('ok')\n"
     )
