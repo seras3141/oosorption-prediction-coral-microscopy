@@ -46,7 +46,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from src.modeling.encoders import DEFAULT_ENCODER, encoder_spec, load_encoder
-# Also imported from here by the M7a notebook and tests, so the name stays available.
+# Re-exported for the M7a notebook.
 from src.modeling.specimen_groups import specimen_of
 from src.modeling.tile_classification_dataset import TileClassificationDataset
 from src.modeling.tile_index import (
@@ -638,9 +638,6 @@ def _build_results(
     rescored: bool,
 ) -> dict[str, Any]:
     """Assemble the results payload."""
-    # The manifest the run was trained and scored against, not the v1 default: under
-    # cross-validation every fold has its own, and hashing the default would record
-    # provenance for a split the numbers never came from.
     manifest_path = _resolve_repo_path(config.split_manifest_path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     return {

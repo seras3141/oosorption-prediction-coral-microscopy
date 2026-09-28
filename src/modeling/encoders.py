@@ -19,13 +19,6 @@ about 0.52 um/px, essentially the 20x regime Phikon-v2 was trained on. Doing the
 a 1024 px tile lands at about 1.05 um/px -- roughly 10x, outside the encoder's training
 domain. So a 1024 px tile is split into four 512 px sub-tiles, each embedded at its
 native magnification, and the four embeddings are mean-pooled.
-
-**256 px is accepted off-magnification; 128 px is refused.** A 256 px tile resized to
-224 lands at about 0.26 um/px, roughly twice the magnification the encoder was trained
-at. That mismatch is accepted deliberately, so the smallest scale the ResNet arm is
-compared at also has a frozen-encoder point, and it has to be read as "encoder off its
-training distribution" as much as "less context". At 128 px it would be about 4x, far
-enough outside that a result would say more about the encoder than the scale.
 """
 
 from __future__ import annotations
@@ -48,8 +41,7 @@ DEFAULT_ENCODER = PHIKON_V2
 
 ENCODER_INPUT_PX = 224
 SUB_TILE_PX = 512
-#: Resized straight to the encoder input, at ~2x its training magnification -- see the
-#: module docstring.
+# ~2x training magnification; 128 px (~4x) refused.
 SMALL_TILE_PX = 256
 FROZEN_TILE_SIZES = (SMALL_TILE_PX, SUB_TILE_PX, 2 * SUB_TILE_PX)
 
@@ -202,8 +194,7 @@ class FrozenEncoderClassifier(nn.Module):
         Width of the backbone's pooled output.
     tile_size : int
         512 embeds the tile once; 1024 embeds four 512 px sub-tiles and mean-pools them,
-        so both scales reach the backbone at the magnification it was trained on. 256
-        embeds the tile once at about twice that magnification.
+        so both scales reach the backbone at the magnification it was trained on.
     hidden_dim : int, optional
         Width of the head's hidden layer.
     dropout : float, optional
@@ -414,13 +405,7 @@ def encoder_input_px(tile_size: int) -> int:
 
     512 px resizes to the backbone's 224 directly. 1024 px resizes to 448 so that each
     quadrant of the 2x2 split arrives at 224, keeping every sub-tile at the ~0.52 um/px
-    magnification the backbone was trained on. 256 px also resizes to 224, which lands
-    at ~0.26 um/px -- about twice that magnification, accepted deliberately.
-
-    Raises
-    ------
-    ValueError
-        For any other size, including 128 px, which would reach the backbone at ~4x.
+    magnification the backbone was trained on.
     """
     if tile_size in (SMALL_TILE_PX, SUB_TILE_PX):
         return ENCODER_INPUT_PX

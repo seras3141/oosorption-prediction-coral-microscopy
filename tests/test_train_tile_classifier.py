@@ -631,8 +631,7 @@ def test_a_replacement_checkpoint_purges_every_evaluation_of_the_old_one(
     assert (tmp_path / "checkpoint.pt").read_text() == "new"
 
 
-#: The six M7a Step 9 runs, as their training logs record them. Their run directories
-#: are named by these ids, so a change to the fingerprint must not move any of them.
+# The six M7a Step 9 run configs.
 _M7A_BASE = dict(
     batch_size=64, epochs=30, hard_negative_mining=True, hard_negative_pool_fraction=0.25,
     hard_negative_share=0.5, head_dropout=0.25, head_hidden_dim=512, label_rule="area",
@@ -666,7 +665,6 @@ def test_existing_run_ids_survive_the_split_manifest_field(overrides: dict, run_
 
 
 def test_a_different_split_manifest_is_a_different_run() -> None:
-    """Four folds of one configuration must land in four directories."""
     ids = {
         TrainingConfig(split_manifest_path=f"data/splits/cv-v1/fold{k}_split_manifest.json").run_id()
         for k in range(1, 5)
@@ -714,8 +712,6 @@ def test_small_tile_sizes_are_accepted_on_the_command_line(size: int) -> None:
 
 
 def test_regenerating_a_manifest_in_place_gives_a_new_run(tmp_path: Path) -> None:
-    """Fold manifests are rewritten at fixed paths; a run on the new split must not reuse
-    the old split's directory and overwrite its checkpoint."""
     manifest = tmp_path / "fold1_split_manifest.json"
     manifest.write_text('{"slides": {"A_1_1-2": {"split": "train"}}}')
     before = TrainingConfig(split_manifest_path=str(manifest))
@@ -728,8 +724,6 @@ def test_regenerating_a_manifest_in_place_gives_a_new_run(tmp_path: Path) -> Non
 
 
 def test_a_checkpoint_config_is_refused_once_its_manifest_changes(tmp_path: Path) -> None:
-    """Otherwise evaluation scores an old checkpoint against a split it never trained on,
-    and records the new file's hash as its provenance."""
     from dataclasses import asdict
 
     manifest = tmp_path / "fold1_split_manifest.json"
@@ -747,5 +741,4 @@ def test_a_checkpoint_config_is_refused_once_its_manifest_changes(tmp_path: Path
 
 
 def test_the_v1_default_is_never_hashed_into_the_run_id() -> None:
-    """Every M7a run id was fingerprinted without a hash; binding one would move them."""
     assert TrainingConfig().split_manifest_sha256 is None

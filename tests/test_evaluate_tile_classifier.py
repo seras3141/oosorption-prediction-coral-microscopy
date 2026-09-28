@@ -660,8 +660,6 @@ def test_the_override_is_refused_for_the_centroid_rule(tmp_path: Path) -> None:
 
 
 def test_results_hash_the_manifest_the_run_used_not_the_default(tmp_path: Path) -> None:
-    """Under cross-validation each fold has its own manifest; recording the v1 hash for a
-    fold run would claim provenance for a split its numbers never came from."""
     import hashlib
     import json
 

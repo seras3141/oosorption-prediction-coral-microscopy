@@ -139,8 +139,6 @@ def test_no_gradient_reaches_the_backbone() -> None:
 
 @pytest.mark.parametrize("tile_size", [128, 2048, 0])
 def test_unsupported_tile_size_is_refused(tile_size: int) -> None:
-    """128 px in particular: resized to 224 it would reach the backbone at ~4x its
-    training magnification, which the plan rules out for this arm."""
     with pytest.raises(ValueError, match="supports tile sizes"):
         _classifier(tile_size)
 
@@ -149,8 +147,6 @@ def test_unsupported_tile_size_is_refused(tile_size: int) -> None:
 
 
 def test_256_px_is_embedded_once_without_pooling() -> None:
-    """256 px is accepted off-magnification: resized straight to 224, like 512 px, and
-    never split into quadrants, which would make 128 px sub-tiles."""
     model = _classifier(256)
 
     assert encoder_input_px(256) == 224

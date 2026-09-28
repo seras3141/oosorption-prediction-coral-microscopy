@@ -67,7 +67,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def format_fold_table(fold_manifest: dict) -> str:
-    """One line per fold: specimens, slides, and tiles/positives/rate per size."""
+    """Format one summary line per fold."""
     sizes = list(fold_manifest["folds"][0]["tiles"])
     lines = []
     for fold in fold_manifest["folds"]:

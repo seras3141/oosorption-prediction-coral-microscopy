@@ -1,8 +1,4 @@
-"""Specimen grouping and the cross-validation fold assignment.
-
-Synthetic tests pin the rules; the real-corpus tests pin the published fold table, so a
-change to the tile index, the labels or the search that moves any fold shows up here.
-"""
+"""Specimen grouping and the cross-validation fold assignment."""
 
 from __future__ import annotations
 
@@ -33,12 +29,7 @@ from src.modeling.specimen_groups import (
 from src.modeling.tile_index import load_tile_index
 
 
-# ---------------------------------------------------------------------------
-# Synthetic fixtures
-
-
 def _counts(rows: dict[str, tuple[int, int]], size: int = 512) -> pd.DataFrame:
-    """A specimen_counts-shaped frame from {specimen: (tiles, positives)} at one size."""
     return pd.DataFrame(
         {
             "site": [site_of(s) for s in rows],
@@ -60,10 +51,6 @@ def _index(stems_labels: dict[str, list[str]], size: int = 512) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# ---------------------------------------------------------------------------
-# Keys
-
-
 @pytest.mark.parametrize(
     ("stem", "expected"),
     [
@@ -79,7 +66,6 @@ def test_specimen_drops_only_the_cut_range(stem: str, expected: str) -> None:
 
 
 def test_evaluator_uses_the_same_specimen_key() -> None:
-    """One definition, not two: the evaluator's bootstrap groups by this key."""
     from src.modeling import evaluate_tile_classifier
 
     assert evaluate_tile_classifier.specimen_of is specimen_of
@@ -88,10 +74,6 @@ def test_evaluator_uses_the_same_specimen_key() -> None:
 def test_straddling_specimens_names_every_split_they_touch() -> None:
     assignments = {"A_X_1_1-2": "train", "A_X_1_3-4": "test", "B_X_2_1-2": "val"}
     assert straddling_specimens(assignments) == {"A_X_1": ["test", "train"]}
-
-
-# ---------------------------------------------------------------------------
-# Counts
 
 
 def test_counts_group_slides_into_their_specimen() -> None:
@@ -107,10 +89,6 @@ def test_counts_group_slides_into_their_specimen() -> None:
     assert counts.at["CHN_A_1", "tiles_512"] == 4
     assert counts.at["CHN_A_1", "positives_512"] == 1
     assert counts.at["CHN_A_1", "ambiguous_512"] == 1
-
-
-# ---------------------------------------------------------------------------
-# Fold assignment
 
 
 def _eight_specimens() -> pd.DataFrame:
@@ -138,19 +116,16 @@ def test_assignment_is_deterministic() -> None:
 def test_positive_floor_is_enforced() -> None:
     counts = _counts({"CHN_A_1": (100, 1), "CHN_A_2": (100, 1),
                       "LHP_A_1": (100, 40), "LHP_A_2": (100, 1)})
-    # Each anchor holds 1 positive, so a floor of 2 forces one LHP specimen into each
-    # fold, even though parking both with one anchor would balance rates no worse.
+    # Floor of 2 forces one LHP per fold.
     assignment = assign_folds(counts, n_folds=2, balance_sizes=(512,),
                               min_positives={512: 2}, max_size_ratio=None)
     assert assignment["LHP_A_1"] != assignment["LHP_A_2"]
-    # Only the fold holding LHP_A_1 can reach 30, so a floor of 30 in both is infeasible.
     with pytest.raises(ValueError, match="positive-tile floor"):
         assign_folds(counts, n_folds=2, balance_sizes=(512,), min_positives={512: 30},
                      max_size_ratio=None)
 
 
 def test_size_cap_stops_the_search_parking_specimens_in_one_fold() -> None:
-    """Rate balance alone is won by one huge mixed fold; the cap forbids it."""
     counts = _counts({"CHN_A_1": (100, 10), "CHN_A_2": (100, 10),
                       "LHP_A_1": (1000, 500), "LHP_A_2": (1000, 0), "LHP_A_3": (100, 10)})
     free = assign_folds(counts, n_folds=2, balance_sizes=(512,), min_positives={},
@@ -171,10 +146,6 @@ def test_anchor_count_must_match_fold_count() -> None:
         assign_folds(_eight_specimens(), n_folds=3, balance_sizes=(512,), min_positives={})
 
 
-# ---------------------------------------------------------------------------
-# Inner validation
-
-
 def test_inner_val_is_never_the_anchor_and_skips_a_dominant_specimen() -> None:
     counts = _counts({
         "CHN_A_1": (100, 15),               # closest rate, but the fold's anchor
@@ -190,10 +161,6 @@ def test_inner_val_refuses_a_fold_with_no_eligible_specimen() -> None:
     counts = _counts({"CHN_A_1": (100, 10), "LHP_A_1": (100, 10)})
     with pytest.raises(ValueError, match="no specimen eligible"):
         choose_inner_val(counts, {"CHN_A_1": 1, "LHP_A_1": 2})
-
-
-# ---------------------------------------------------------------------------
-# Per-fold split manifests
 
 
 def _manifest() -> dict:
@@ -244,7 +211,6 @@ def test_written_hashes_are_the_hashes_of_the_written_files(tmp_path: Path) -> N
 
 
 def test_a_fold_split_manifest_drives_the_tile_index(tmp_path: Path) -> None:
-    """The per-fold manifest is consumed by load_tile_index exactly like v1."""
     stems = ("CHN_A_1_1-2", "LHP_A_1_1-2")
     for stem in stems:
         cut = f"{stem}_cut000"
@@ -273,10 +239,6 @@ def test_a_fold_split_manifest_drives_the_tile_index(tmp_path: Path) -> None:
 
     index = load_tile_index(**{**paths, "split_manifest_path": split_path})
     assert dict(index.groupby("stem")["split"].first()) == {stems[0]: "test", stems[1]: "val"}
-
-
-# ---------------------------------------------------------------------------
-# Real corpus -- pins the fold table in the M7b plan
 
 
 @pytest.fixture(scope="module")
