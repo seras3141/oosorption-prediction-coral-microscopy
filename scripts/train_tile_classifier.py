@@ -83,7 +83,12 @@ def _upper_inclusive_unit(value: str) -> float:
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    return build_parser().parse_args(argv)
+
+
+def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.ArgumentParser:
+    """Add the training flags to ``parser``, shared with the CV CLI."""
+    parser = parser or argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--architecture", choices=ARCHITECTURES, default="resnet18")
     parser.add_argument(
         "--encoder-name", default=None, choices=SUPPORTED_ENCODERS,
@@ -161,11 +166,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", default="data/tile_classifier")
     parser.add_argument("--log-level", default="INFO")
-    return parser.parse_args(argv)
+    return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = _parse_args(argv)
+def config_from_args(args: argparse.Namespace) -> TrainingConfig:
+    """Build the run configuration from parsed training flags."""
     if args.encoder_name and args.architecture != "frozen_encoder":
         # It would otherwise change the run id and the recorded config while the model
         # ignored it, so two "different" runs would be the same experiment.
@@ -173,11 +178,7 @@ def main(argv: list[str] | None = None) -> int:
             f"--encoder-name is only meaningful with --architecture frozen_encoder; "
             f"got --architecture {args.architecture}"
         )
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-    config = TrainingConfig(
+    return TrainingConfig(
         architecture=args.architecture,
         encoder_name=args.encoder_name,
         tile_size=args.tile_size,
@@ -206,6 +207,15 @@ def main(argv: list[str] | None = None) -> int:
         max_val_tiles=args.max_val_tiles,
         split_manifest_path=args.split_manifest,
         output_dir=args.output_dir,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    config = config_from_args(args)
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     result = train(config)
 
