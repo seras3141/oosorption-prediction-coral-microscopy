@@ -385,23 +385,6 @@ def test_train_summary_describes_only_the_slides_the_model_saw() -> None:
     assert capped["max_train_slides"] == 2
 
 
-@pytest.mark.parametrize(
-    ("stem", "expected"),
-    [
-        ("CHN_SP_5_22-24", "CHN_SP_5"),
-        ("CHN_SP_5_25-27", "CHN_SP_5"),
-        ("LHP_W_10_28-30", "LHP_W_10"),
-        ("LHP_SP_6_3-4", "LHP_SP_6"),
-        ("nounderscore", "nounderscore"),
-    ],
-)
-def test_specimen_is_the_stem_without_its_cut_range(stem: str, expected: str) -> None:
-    """Two cut ranges of one polyp are serial sections, not independent samples."""
-    from src.modeling.evaluate_tile_classifier import specimen_of
-
-    assert specimen_of(stem) == expected
-
-
 def test_intervals_resample_specimens_not_slides() -> None:
     """Under grouped cross-validation a fold holds several slides of one specimen.
     Resampling slides would then treat serial sections through one polyp as independent

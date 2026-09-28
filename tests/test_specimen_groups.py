@@ -58,6 +58,7 @@ def _index(stems_labels: dict[str, list[str]], size: int = 512) -> pd.DataFrame:
         ("CHN_SP_5_25-27", "CHN_SP_5"),
         ("LHP_SU_10_52-54", "LHP_SU_10"),
         ("LHP_SP_6_3-4", "LHP_SP_6"),
+        ("nounderscore", "nounderscore"),
     ],
 )
 def test_specimen_drops_only_the_cut_range(stem: str, expected: str) -> None:

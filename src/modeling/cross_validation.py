@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from src.modeling.specimen_groups import specimen_of
+from src.modeling.tile_index import _resolve_repo_path
 
 if TYPE_CHECKING:
     from src.modeling.train_tile_classifier import TrainingConfig
@@ -122,7 +123,6 @@ def run_fold(
     fold_manifest: dict[str, Any],
     fold: int,
     bootstrap_samples: int = 2000,
-    eval_num_workers: int | None = None,
 ) -> dict[str, Any]:
     """Train and evaluate one fold, checking isolation before and after."""
     from src.modeling.evaluate_tile_classifier import evaluate
@@ -146,7 +146,7 @@ def run_fold(
     results = evaluate(
         _resolve_repo_path(config.output_dir) / result.run_id,
         bootstrap_samples=bootstrap_samples,
-        num_workers=config.num_workers if eval_num_workers is None else eval_num_workers,
+        num_workers=config.num_workers,
     )
     check_fold_isolation(
         pd.read_csv(_resolve_repo_path(results["predictions_path"])), fold_manifest, fold
@@ -302,11 +302,6 @@ def _fold_entry(fold_manifest: dict[str, Any], fold: int) -> dict[str, Any]:
         if entry["fold"] == fold:
             return entry
     raise ValueError(f"fold {fold} is not in the fold manifest")
-
-
-def _resolve_repo_path(path: str | Path) -> Path:
-    candidate = Path(path)
-    return candidate if candidate.is_absolute() else REPO_ROOT / candidate
 
 
 def _path_relative_to_repo(path: Path) -> str:
