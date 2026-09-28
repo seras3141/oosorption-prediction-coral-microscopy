@@ -21,7 +21,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.modeling.train_tile_classifier import ARCHITECTURES, TrainingConfig, train
 from src.modeling.encoders import DEFAULT_ENCODER, SUPPORTED_ENCODERS
-from src.modeling.tile_index import LABEL_RULES
+from src.modeling.tile_index import DEFAULT_SPLIT_MANIFEST, LABEL_RULES
 from src.modeling.tile_labels import DEFAULT_MIN_OOCYTE_AREA_FRACTION
 
 
@@ -83,15 +83,26 @@ def _upper_inclusive_unit(value: str) -> float:
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    return build_parser().parse_args(argv)
+
+
+def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.ArgumentParser:
+    """Add the training flags to ``parser``, shared with the CV CLI."""
+    parser = parser or argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--architecture", choices=ARCHITECTURES, default="resnet18")
     parser.add_argument(
         "--encoder-name", default=None, choices=SUPPORTED_ENCODERS,
         help="Frozen-encoder arm only. Default: %s." % DEFAULT_ENCODER,
     )
     parser.add_argument(
-        "--tile-size", type=int, choices=(512, 1024), default=512,
-        help="One size per run: the dataset refuses a mixed index.",
+        "--tile-size", type=int, choices=(128, 256, 512, 1024), default=512,
+        help="One size per run: the dataset refuses a mixed index. The frozen-encoder "
+             "arm refuses 128.",
+    )
+    parser.add_argument(
+        "--split-manifest", default=DEFAULT_SPLIT_MANIFEST,
+        help="Slide-to-split manifest to train and validate against. Default: the v1 "
+             "slide-level split, %(default)s. Cross-validation passes one per fold.",
     )
     parser.add_argument("--label-rule", choices=LABEL_RULES, default="area")
     parser.add_argument(
@@ -155,11 +166,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", default="data/tile_classifier")
     parser.add_argument("--log-level", default="INFO")
-    return parser.parse_args(argv)
+    return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = _parse_args(argv)
+def config_from_args(args: argparse.Namespace) -> TrainingConfig:
+    """Build the run configuration from parsed training flags."""
     if args.encoder_name and args.architecture != "frozen_encoder":
         # It would otherwise change the run id and the recorded config while the model
         # ignored it, so two "different" runs would be the same experiment.
@@ -167,11 +178,7 @@ def main(argv: list[str] | None = None) -> int:
             f"--encoder-name is only meaningful with --architecture frozen_encoder; "
             f"got --architecture {args.architecture}"
         )
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-    config = TrainingConfig(
+    return TrainingConfig(
         architecture=args.architecture,
         encoder_name=args.encoder_name,
         tile_size=args.tile_size,
@@ -198,7 +205,17 @@ def main(argv: list[str] | None = None) -> int:
         max_train_slides=args.max_train_slides,
         max_batches_per_epoch=args.max_batches_per_epoch,
         max_val_tiles=args.max_val_tiles,
+        split_manifest_path=args.split_manifest,
         output_dir=args.output_dir,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    config = config_from_args(args)
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     result = train(config)
 
