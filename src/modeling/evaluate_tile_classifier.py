@@ -334,6 +334,10 @@ def _restore_model(config: TrainingConfig, checkpoint: dict[str, Any]) -> torch.
     """
     scope = checkpoint.get("state_dict_scope", "model")
     state = checkpoint["model_state_dict"]
+    if scope == "head" and config.embedding_cache_dir:
+        model = build_model(config)
+        model.head.load_state_dict(state)
+        return model
     if scope == "head":
         model = load_encoder(
             encoder_name=config.encoder_name or DEFAULT_ENCODER,
@@ -359,13 +363,19 @@ def _predict(
     num_workers: int,
 ) -> np.ndarray:
     """Predicted positive probability per row, in the frame's own order."""
-    mean, std = normalisation_for(config)
-    dataset = TileClassificationDataset(
-        frame,
-        transform=build_transforms(
-            train=False, input_px=input_px_for(config), mean=mean, std=std
-        ),
-    )
+    if config.embedding_cache_dir:
+        from src.modeling.embedding_cache import CachedEmbeddingDataset, load_cache
+
+        cache = load_cache(config.embedding_cache_dir, config.tile_size, config.encoder_name)
+        dataset = CachedEmbeddingDataset(frame, cache, config.quadrant_pooling)
+    else:
+        mean, std = normalisation_for(config)
+        dataset = TileClassificationDataset(
+            frame,
+            transform=build_transforms(
+                train=False, input_px=input_px_for(config), mean=mean, std=std
+            ),
+        )
     loader = DataLoader(
         dataset, batch_size=config.batch_size, shuffle=False, num_workers=num_workers
     )
@@ -669,6 +679,16 @@ def _build_results(
         "warmup_epochs": config.warmup_epochs,
         "hard_negative_pool_fraction": config.hard_negative_pool_fraction,
         "hard_negative_share": config.hard_negative_share,
+        "augmentation": "none (cached embeddings)" if config.embedding_cache_dir else "standard",
+        "embedding_cache": (
+            {
+                "dir": config.embedding_cache_dir,
+                "meta_sha256": config.embedding_cache_sha256,
+                "quadrant_pooling": config.quadrant_pooling,
+            }
+            if config.embedding_cache_dir
+            else None
+        ),
         # From the training log, not the checkpoint. The checkpoint is only written on
         # an improving epoch, so its "epoch" is the best one -- reporting that as
         # epochs_run understates an early-stopped run by however long it ran after its
