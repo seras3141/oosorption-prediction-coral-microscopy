@@ -72,9 +72,10 @@ coral-download-geojson = "scripts.download_geojson:main"
 coral-verify-tile-labels = "scripts.verify_tile_labels:main"
 coral-train-tile-classifier = "scripts.train_tile_classifier:main"
 coral-evaluate-tile-classifier = "scripts.evaluate_tile_classifier:main"
+coral-plot-cut-maps = "scripts.plot_cut_maps:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/data_preparation", "src/modeling", "scripts"]
+packages = ["src/data_preparation", "src/modeling", "src/visualization", "scripts"]
 
 [tool.pytest.ini_options]
 # Without testpaths, a bare `pytest` recurses from the repo root and stats every file
