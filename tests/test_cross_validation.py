@@ -150,7 +150,7 @@ def test_a_correct_fold_index_passes(held_out: int) -> None:
 def test_training_on_a_held_out_specimen_is_refused() -> None:
     index = _index(1)
     index.loc[index["stem"] == "LHP_A_1_1-2", "split"] = "train"
-    with pytest.raises(ValueError, match="held-out tiles from outside|held-out specimens in"):
+    with pytest.raises(ValueError, match="specimens do not match"):
         check_fold_isolation(index, _fold_manifest(), 1)
 
 
@@ -164,8 +164,27 @@ def test_one_tile_of_a_specimen_on_the_wrong_side_is_caught() -> None:
 def test_validating_on_anything_but_inner_val_is_refused() -> None:
     index = _index(1)
     index.loc[index["stem"] == "CHN_A_2_1-2", "split"] = "val"
-    with pytest.raises(ValueError, match="non-inner-val"):
+    with pytest.raises(ValueError, match="specimens do not match"):
         check_fold_isolation(index, _fold_manifest(), 1)
+
+
+def test_an_entire_missing_specimen_is_caught() -> None:
+    index = _index(1)
+    index = index.loc[index["stem"] != "CHN_A_1_1-2"]
+    with pytest.raises(ValueError, match=r"test specimens.*missing \['CHN_A_1'\]"):
+        check_fold_isolation(index, _fold_manifest(), 1)
+
+
+def test_prediction_log_requires_exact_val_and_test_sets() -> None:
+    predictions = _predictions(1)
+    check_fold_isolation(
+        predictions, _fold_manifest(), 1, required_splits=("val", "test")
+    )
+    incomplete = predictions.loc[predictions["stem"] != "LHP_A_2_1-2"]
+    with pytest.raises(ValueError, match=r"val specimens.*missing \['LHP_A_2'\]"):
+        check_fold_isolation(
+            incomplete, _fold_manifest(), 1, required_splits=("val", "test")
+        )
 
 
 def test_coverage_counts_each_held_out_tile_once() -> None:
@@ -278,6 +297,7 @@ def test_real_fold_splits_isolate_specimens_and_cover_every_tile_once() -> None:
         ([1, 2], True, True, False),
         ([1, 2, 3, 4], True, False, False),
         ([5], False, False, True),
+        ([1, 1], False, False, True),
     ],
 )
 def test_a_fold_subset_that_could_not_aggregate_is_refused_before_training(

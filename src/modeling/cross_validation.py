@@ -67,12 +67,24 @@ def fold_config(
 
 
 def check_fold_isolation(
-    index: pd.DataFrame, fold_manifest: dict[str, Any], fold: int
+    index: pd.DataFrame,
+    fold_manifest: dict[str, Any],
+    fold: int,
+    required_splits: tuple[str, ...] = ("train", "val", "test"),
 ) -> dict[str, list[str]]:
-    """Check tile by tile that every specimen stays on one side."""
+    """Check that each required split has exactly its assigned specimens."""
     entry = _fold_entry(fold_manifest, fold)
     held_out = set(entry["specimens"])
     inner_val = {f["inner_val_specimen"] for f in fold_manifest["folds"] if f["fold"] != fold}
+    all_specimens = {s for f in fold_manifest["folds"] for s in f["specimens"]}
+    expected = {
+        "test": held_out,
+        "val": inner_val,
+        "train": all_specimens - held_out - inner_val,
+    }
+    unknown_splits = set(required_splits) - set(expected)
+    if unknown_splits:
+        raise ValueError(f"unknown required split(s): {sorted(unknown_splits)}")
 
     specimens = index["stem"].map(specimen_of)
     sides = pd.DataFrame({"specimen": specimens, "split": index["split"]}).drop_duplicates()
@@ -85,17 +97,15 @@ def check_fold_isolation(
         split: sorted(sides.loc[sides["split"] == split, "specimen"])
         for split in sorted(sides["split"].unique())
     }
-    stray_test = set(found.get("test", [])) - held_out
-    if stray_test:
-        raise ValueError(f"fold {fold}: held-out tiles from outside the fold: {sorted(stray_test)}")
-    stray_val = set(found.get("val", [])) - inner_val
-    if stray_val:
-        raise ValueError(
-            f"fold {fold}: validation tiles from non-inner-val specimens: {sorted(stray_val)}"
-        )
-    leaked = set(found.get("train", [])) & held_out
-    if leaked:
-        raise ValueError(f"fold {fold}: held-out specimens in training: {sorted(leaked)}")
+    for split in required_splits:
+        actual = set(found.get(split, []))
+        missing = sorted(expected[split] - actual)
+        unexpected = sorted(actual - expected[split])
+        if missing or unexpected:
+            raise ValueError(
+                f"fold {fold}: {split} specimens do not match the fold manifest; "
+                f"missing {missing}, unexpected {unexpected}"
+            )
     return found
 
 
@@ -149,7 +159,10 @@ def run_fold(
         num_workers=config.num_workers,
     )
     check_fold_isolation(
-        pd.read_csv(_resolve_repo_path(results["predictions_path"])), fold_manifest, fold
+        pd.read_csv(_resolve_repo_path(results["predictions_path"])),
+        fold_manifest,
+        fold,
+        required_splits=("val", "test"),
     )
     return results
 
@@ -239,7 +252,9 @@ def aggregate(
                 "this fold manifest records"
             )
         predictions = pd.read_csv(_resolve_repo_path(results["predictions_path"]))
-        check_fold_isolation(predictions, fold_manifest, fold)
+        check_fold_isolation(
+            predictions, fold_manifest, fold, required_splits=("val", "test")
+        )
         held_out[fold] = predictions.loc[predictions["split"] == "test"]
         per_fold.append(fold_summary(results, fold))
 

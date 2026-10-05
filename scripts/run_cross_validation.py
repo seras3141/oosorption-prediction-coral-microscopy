@@ -62,6 +62,8 @@ def check_fold_selection(
     folds: list[int], manifest_folds: list[int], *, aggregate: bool, allow_partial: bool
 ) -> None:
     """Refuse, before any training, a fold subset the aggregate would reject."""
+    if len(folds) != len(set(folds)):
+        raise SystemExit("--folds must not contain duplicates")
     unknown = sorted(set(folds) - set(manifest_folds))
     if unknown:
         raise SystemExit(f"fold(s) {unknown} are not in the fold manifest")
