@@ -110,9 +110,9 @@ def check_fold_isolation(
 
 
 def check_coverage(
-    held_out_predictions: dict[int, pd.DataFrame], expected_tiles: int | None = None
+    held_out_predictions: dict[int, pd.DataFrame], expected_tile_ids: set[str] | None = None
 ) -> int:
-    """Confirm each scored tile is held out exactly once."""
+    """Confirm each scorable tile is held out exactly once, and nothing else is."""
     ids = pd.concat([frame["tile_id"] for frame in held_out_predictions.values()],
                     ignore_index=True)
     duplicated = ids[ids.duplicated()]
@@ -121,10 +121,16 @@ def check_coverage(
             f"{duplicated.nunique()} tile(s) held out by more than one fold, e.g. "
             f"{duplicated.iloc[0]}"
         )
-    if expected_tiles is not None and len(ids) != expected_tiles:
-        raise ValueError(
-            f"{len(ids)} tiles held out across the folds, expected {expected_tiles}"
-        )
+    if expected_tile_ids is not None:
+        held = set(ids)
+        missing = sorted(expected_tile_ids - held)
+        unexpected = sorted(held - expected_tile_ids)
+        if missing or unexpected:
+            raise ValueError(
+                f"held-out tiles do not match the scorable tiles: {len(missing)} never "
+                f"held out {missing[:3]}, {len(unexpected)} not scorable at this size "
+                f"and labelling {unexpected[:3]}"
+            )
     return int(len(ids))
 
 
@@ -258,8 +264,11 @@ def aggregate(
         held_out[fold] = predictions.loc[predictions["split"] == "test"]
         per_fold.append(fold_summary(results, fold))
 
-    expected_tiles = None if missing else _scorable_tiles(fold_manifest, base)
-    n_held_out = check_coverage(held_out, expected_tiles)
+    expected = None
+    if not missing:
+        label_rule, area_fraction = scoring_labelling(base, fold_results)
+        expected = scorable_tile_ids(fold_manifest, base.tile_size, label_rule, area_fraction)
+    n_held_out = check_coverage(held_out, expected)
 
     return {
         "cv_run_id": cv_run_id(base, fold_manifest["_sha256"]),
@@ -293,23 +302,36 @@ def write_cv_results(results: dict[str, Any], output_dir: str | Path = DEFAULT_C
     return path
 
 
-def _scorable_tiles(fold_manifest: dict[str, Any], base: "TrainingConfig") -> int | None:
-    """Count the scorable tiles the folds should hold out."""
-    from src.modeling.tile_index import LABEL_RULE_AREA
-    from src.modeling.tile_labels import DEFAULT_MIN_OOCYTE_AREA_FRACTION
+def scoring_labelling(
+    base: "TrainingConfig", fold_results: dict[int, dict[str, Any]]
+) -> tuple[str, float]:
+    """Return the labelling all folds were scored under; refuse disagreement."""
+    labellings = {
+        (
+            results.get("label_rule", base.label_rule),
+            results.get("eval_min_oocyte_area_fraction", base.min_oocyte_area_fraction),
+        )
+        for results in fold_results.values()
+    }
+    if len(labellings) != 1:
+        raise ValueError(f"folds were scored under different labellings: {sorted(labellings)}")
+    return labellings.pop()
 
-    if (base.label_rule, base.min_oocyte_area_fraction) != (
-        LABEL_RULE_AREA, DEFAULT_MIN_OOCYTE_AREA_FRACTION
-    ):
-        # Manifest counts assume the default labelling.
-        return None
-    key = str(base.tile_size)
-    expected = 0
-    for fold in fold_manifest["folds"]:
-        if key not in fold["tiles"] or key not in fold.get("ambiguous", {}):
-            return None
-        expected += fold["tiles"][key] - fold["ambiguous"][key]
-    return expected
+
+def scorable_tile_ids(
+    fold_manifest: dict[str, Any], tile_size: int, label_rule: str, min_oocyte_area_fraction: float
+) -> set[str]:
+    """Return every tile scorable at this size and labelling."""
+    from src.modeling.tile_index import load_tile_index, training_rows
+
+    # Any fold manifest lists every slide.
+    index = load_tile_index(
+        split_manifest_path=fold_manifest["folds"][0]["split_manifest_path"],
+        tile_sizes=(tile_size,),
+        label_rule=label_rule,
+        min_oocyte_area_fraction=min_oocyte_area_fraction,
+    )
+    return set(training_rows(index)["tile_id"])
 
 
 def _fold_entry(fold_manifest: dict[str, Any], fold: int) -> dict[str, Any]:
