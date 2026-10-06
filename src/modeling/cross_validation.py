@@ -264,10 +264,10 @@ def aggregate(
         held_out[fold] = predictions.loc[predictions["split"] == "test"]
         per_fold.append(fold_summary(results, fold))
 
-    expected = None
-    if not missing:
-        label_rule, area_fraction = scoring_labelling(base, fold_results)
-        expected = scorable_tile_ids(fold_manifest, base.tile_size, label_rule, area_fraction)
+    label_rule, area_fraction = scoring_labelling(base, fold_results)
+    expected = None if missing else scorable_tile_ids(
+        fold_manifest, base.tile_size, label_rule, area_fraction
+    )
     n_held_out = check_coverage(held_out, expected)
 
     return {

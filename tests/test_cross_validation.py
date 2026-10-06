@@ -297,6 +297,24 @@ def test_folds_scored_under_different_labellings_are_refused(tmp_path: Path) -> 
         aggregate(TrainingConfig(), _fold_manifest(), fold_results)
 
 
+def test_a_partial_aggregate_with_mixed_labellings_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.modeling.cross_validation as module
+
+    # The added empty fold fails isolation.
+    monkeypatch.setattr(module, "check_fold_isolation", lambda *a, **k: {})
+    manifest = _fold_manifest()
+    manifest["n_folds"] = 3
+    manifest["folds"].append({**manifest["folds"][1], "fold": 3, "specimens": [], "slides": [],
+                              "split_manifest_sha256": "sha-fold3"})
+    fold_results = _fold_results(tmp_path)
+    fold_results[1]["eval_min_oocyte_area_fraction"] = 0.05
+    fold_results[2]["eval_min_oocyte_area_fraction"] = 0.25
+    with pytest.raises(ValueError, match="different labellings"):
+        aggregate(TrainingConfig(), manifest, fold_results, allow_partial=True)
+
+
 @pytest.mark.usefixtures("synthetic_scorable_tiles")
 def test_a_substituted_tile_with_the_right_count_is_refused(tmp_path: Path) -> None:
     fold_results = _fold_results(tmp_path)
