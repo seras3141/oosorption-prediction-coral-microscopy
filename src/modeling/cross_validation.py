@@ -67,12 +67,24 @@ def fold_config(
 
 
 def check_fold_isolation(
-    index: pd.DataFrame, fold_manifest: dict[str, Any], fold: int
+    index: pd.DataFrame,
+    fold_manifest: dict[str, Any],
+    fold: int,
+    required_splits: tuple[str, ...] = ("train", "val", "test"),
 ) -> dict[str, list[str]]:
-    """Check tile by tile that every specimen stays on one side."""
+    """Check that each required split has exactly its assigned specimens."""
     entry = _fold_entry(fold_manifest, fold)
     held_out = set(entry["specimens"])
     inner_val = {f["inner_val_specimen"] for f in fold_manifest["folds"] if f["fold"] != fold}
+    all_specimens = {s for f in fold_manifest["folds"] for s in f["specimens"]}
+    expected = {
+        "test": held_out,
+        "val": inner_val,
+        "train": all_specimens - held_out - inner_val,
+    }
+    unknown_splits = set(required_splits) - set(expected)
+    if unknown_splits:
+        raise ValueError(f"unknown required split(s): {sorted(unknown_splits)}")
 
     specimens = index["stem"].map(specimen_of)
     sides = pd.DataFrame({"specimen": specimens, "split": index["split"]}).drop_duplicates()
@@ -85,24 +97,22 @@ def check_fold_isolation(
         split: sorted(sides.loc[sides["split"] == split, "specimen"])
         for split in sorted(sides["split"].unique())
     }
-    stray_test = set(found.get("test", [])) - held_out
-    if stray_test:
-        raise ValueError(f"fold {fold}: held-out tiles from outside the fold: {sorted(stray_test)}")
-    stray_val = set(found.get("val", [])) - inner_val
-    if stray_val:
-        raise ValueError(
-            f"fold {fold}: validation tiles from non-inner-val specimens: {sorted(stray_val)}"
-        )
-    leaked = set(found.get("train", [])) & held_out
-    if leaked:
-        raise ValueError(f"fold {fold}: held-out specimens in training: {sorted(leaked)}")
+    for split in required_splits:
+        actual = set(found.get(split, []))
+        missing = sorted(expected[split] - actual)
+        unexpected = sorted(actual - expected[split])
+        if missing or unexpected:
+            raise ValueError(
+                f"fold {fold}: {split} specimens do not match the fold manifest; "
+                f"missing {missing}, unexpected {unexpected}"
+            )
     return found
 
 
 def check_coverage(
-    held_out_predictions: dict[int, pd.DataFrame], expected_tiles: int | None = None
+    held_out_predictions: dict[int, pd.DataFrame], expected_tile_ids: set[str] | None = None
 ) -> int:
-    """Confirm each scored tile is held out exactly once."""
+    """Confirm each scorable tile is held out exactly once, and nothing else is."""
     ids = pd.concat([frame["tile_id"] for frame in held_out_predictions.values()],
                     ignore_index=True)
     duplicated = ids[ids.duplicated()]
@@ -111,10 +121,16 @@ def check_coverage(
             f"{duplicated.nunique()} tile(s) held out by more than one fold, e.g. "
             f"{duplicated.iloc[0]}"
         )
-    if expected_tiles is not None and len(ids) != expected_tiles:
-        raise ValueError(
-            f"{len(ids)} tiles held out across the folds, expected {expected_tiles}"
-        )
+    if expected_tile_ids is not None:
+        held = set(ids)
+        missing = sorted(expected_tile_ids - held)
+        unexpected = sorted(held - expected_tile_ids)
+        if missing or unexpected:
+            raise ValueError(
+                f"held-out tiles do not match the scorable tiles: {len(missing)} never "
+                f"held out {missing[:3]}, {len(unexpected)} not scorable at this size "
+                f"and labelling {unexpected[:3]}"
+            )
     return int(len(ids))
 
 
@@ -149,7 +165,10 @@ def run_fold(
         num_workers=config.num_workers,
     )
     check_fold_isolation(
-        pd.read_csv(_resolve_repo_path(results["predictions_path"])), fold_manifest, fold
+        pd.read_csv(_resolve_repo_path(results["predictions_path"])),
+        fold_manifest,
+        fold,
+        required_splits=("val", "test"),
     )
     return results
 
@@ -239,13 +258,28 @@ def aggregate(
                 f"fold {fold} was evaluated against a split manifest other than the one "
                 "this fold manifest records"
             )
+        expected_run_id = fold_config(base, fold_manifest, fold).run_id()
+        if results.get("run_id") != expected_run_id:
+            raise ValueError(
+                f"fold {fold} comes from run {results.get('run_id')}, a different "
+                f"configuration from the one being aggregated ({expected_run_id})"
+            )
         predictions = pd.read_csv(_resolve_repo_path(results["predictions_path"]))
-        check_fold_isolation(predictions, fold_manifest, fold)
+        check_fold_isolation(
+            predictions, fold_manifest, fold, required_splits=("val", "test")
+        )
         held_out[fold] = predictions.loc[predictions["split"] == "test"]
         per_fold.append(fold_summary(results, fold))
 
-    expected_tiles = None if missing else _scorable_tiles(fold_manifest, base)
-    n_held_out = check_coverage(held_out, expected_tiles)
+    label_rule, area_fraction = scoring_labelling(base, fold_results)
+    held_out_specimens = {
+        specimen for fold in fold_results for specimen in _fold_entry(fold_manifest, fold)["specimens"]
+    }
+    expected = scorable_tile_ids(
+        fold_manifest, base.tile_size, label_rule, area_fraction,
+        specimens=held_out_specimens if missing else None,
+    )
+    n_held_out = check_coverage(held_out, expected)
 
     return {
         "cv_run_id": cv_run_id(base, fold_manifest["_sha256"]),
@@ -279,23 +313,43 @@ def write_cv_results(results: dict[str, Any], output_dir: str | Path = DEFAULT_C
     return path
 
 
-def _scorable_tiles(fold_manifest: dict[str, Any], base: "TrainingConfig") -> int | None:
-    """Count the scorable tiles the folds should hold out."""
-    from src.modeling.tile_index import LABEL_RULE_AREA
-    from src.modeling.tile_labels import DEFAULT_MIN_OOCYTE_AREA_FRACTION
+def scoring_labelling(
+    base: "TrainingConfig", fold_results: dict[int, dict[str, Any]]
+) -> tuple[str, float]:
+    """Return the labelling all folds were scored under; refuse disagreement."""
+    labellings = {
+        (
+            results.get("label_rule", base.label_rule),
+            results.get("eval_min_oocyte_area_fraction", base.min_oocyte_area_fraction),
+        )
+        for results in fold_results.values()
+    }
+    if len(labellings) != 1:
+        raise ValueError(f"folds were scored under different labellings: {sorted(labellings)}")
+    return labellings.pop()
 
-    if (base.label_rule, base.min_oocyte_area_fraction) != (
-        LABEL_RULE_AREA, DEFAULT_MIN_OOCYTE_AREA_FRACTION
-    ):
-        # Manifest counts assume the default labelling.
-        return None
-    key = str(base.tile_size)
-    expected = 0
-    for fold in fold_manifest["folds"]:
-        if key not in fold["tiles"] or key not in fold.get("ambiguous", {}):
-            return None
-        expected += fold["tiles"][key] - fold["ambiguous"][key]
-    return expected
+
+def scorable_tile_ids(
+    fold_manifest: dict[str, Any],
+    tile_size: int,
+    label_rule: str,
+    min_oocyte_area_fraction: float,
+    specimens: set[str] | None = None,
+) -> set[str]:
+    """Return every tile scorable at this size and labelling, optionally per specimen."""
+    from src.modeling.tile_index import load_tile_index, training_rows
+
+    # Any fold manifest lists every slide.
+    index = load_tile_index(
+        split_manifest_path=fold_manifest["folds"][0]["split_manifest_path"],
+        tile_sizes=(tile_size,),
+        label_rule=label_rule,
+        min_oocyte_area_fraction=min_oocyte_area_fraction,
+    )
+    scorable = training_rows(index)
+    if specimens is not None:
+        scorable = scorable.loc[scorable["stem"].map(specimen_of).isin(specimens)]
+    return set(scorable["tile_id"])
 
 
 def _fold_entry(fold_manifest: dict[str, Any], fold: int) -> dict[str, Any]:

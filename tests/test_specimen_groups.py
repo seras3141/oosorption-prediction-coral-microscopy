@@ -158,6 +158,15 @@ def test_inner_val_is_never_the_anchor_and_skips_a_dominant_specimen() -> None:
     assert chosen == {1: "LHP_A_2"}
 
 
+def test_inner_val_skips_a_specimen_without_reference_size_tiles() -> None:
+    counts = _counts({"CHN_A_1": (100, 90), "LHP_A_0": (0, 0), "LHP_A_1": (100, 15)})
+    assert choose_inner_val(counts, {s: 1 for s in counts.index}) == {1: "LHP_A_1"}
+
+    only_empty = _counts({"CHN_A_1": (100, 10), "LHP_A_0": (0, 0)})
+    with pytest.raises(ValueError, match="no specimen eligible"):
+        choose_inner_val(only_empty, {s: 1 for s in only_empty.index})
+
+
 def test_inner_val_refuses_a_fold_with_no_eligible_specimen() -> None:
     counts = _counts({"CHN_A_1": (100, 10), "LHP_A_1": (100, 10)})
     with pytest.raises(ValueError, match="no specimen eligible"):

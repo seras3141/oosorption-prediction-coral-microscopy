@@ -149,6 +149,7 @@ def choose_inner_val(
             s for s, f in assignment.items()
             if f == fold
             and counts.at[s, "site"] != ANCHOR_SITE
+            and tiles[s] > 0
             and share[s] <= max_positive_share
         )
         if not candidates:

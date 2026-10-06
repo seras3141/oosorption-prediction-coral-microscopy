@@ -75,7 +75,7 @@ def _predictions(held_out: int, tiles_per_slide: int = 4) -> pd.DataFrame:
 def _results(held_out: int, predictions_path: Path, auprc: float = 0.8,
              positive_rate: float = 0.25) -> dict:
     return {
-        "run_id": f"run-fold{held_out}",
+        "run_id": fold_config(TrainingConfig(), _fold_manifest(), held_out).run_id(),
         "split_manifest_sha256": f"sha-fold{held_out}",
         "decision_threshold": 0.5,
         "threshold_selection": "max_val_f1",
@@ -150,7 +150,7 @@ def test_a_correct_fold_index_passes(held_out: int) -> None:
 def test_training_on_a_held_out_specimen_is_refused() -> None:
     index = _index(1)
     index.loc[index["stem"] == "LHP_A_1_1-2", "split"] = "train"
-    with pytest.raises(ValueError, match="held-out tiles from outside|held-out specimens in"):
+    with pytest.raises(ValueError, match="specimens do not match"):
         check_fold_isolation(index, _fold_manifest(), 1)
 
 
@@ -164,13 +164,47 @@ def test_one_tile_of_a_specimen_on_the_wrong_side_is_caught() -> None:
 def test_validating_on_anything_but_inner_val_is_refused() -> None:
     index = _index(1)
     index.loc[index["stem"] == "CHN_A_2_1-2", "split"] = "val"
-    with pytest.raises(ValueError, match="non-inner-val"):
+    with pytest.raises(ValueError, match="specimens do not match"):
         check_fold_isolation(index, _fold_manifest(), 1)
+
+
+def test_an_entire_missing_specimen_is_caught() -> None:
+    index = _index(1)
+    index = index.loc[index["stem"] != "CHN_A_1_1-2"]
+    with pytest.raises(ValueError, match=r"test specimens.*missing \['CHN_A_1'\]"):
+        check_fold_isolation(index, _fold_manifest(), 1)
+
+
+def test_prediction_log_requires_exact_val_and_test_sets() -> None:
+    predictions = _predictions(1)
+    check_fold_isolation(
+        predictions, _fold_manifest(), 1, required_splits=("val", "test")
+    )
+    incomplete = predictions.loc[predictions["stem"] != "LHP_A_2_1-2"]
+    with pytest.raises(ValueError, match=r"val specimens.*missing \['LHP_A_2'\]"):
+        check_fold_isolation(
+            incomplete, _fold_manifest(), 1, required_splits=("val", "test")
+        )
+
+
+SYNTHETIC_TILE_IDS = {f"{stem}_t{i}" for stem in STEMS for i in range(4)}
+
+
+def _synthetic_scorable(*args, specimens=None) -> set[str]:
+    return {t for t in SYNTHETIC_TILE_IDS
+            if specimens is None or t.rsplit("_", 2)[0] in specimens}
+
+
+@pytest.fixture
+def synthetic_scorable_tiles(monkeypatch: pytest.MonkeyPatch) -> None:
+    import src.modeling.cross_validation as module
+
+    monkeypatch.setattr(module, "scorable_tile_ids", _synthetic_scorable)
 
 
 def test_coverage_counts_each_held_out_tile_once() -> None:
     held_out = {f: _predictions(f).query("split == 'test'") for f in (1, 2)}
-    assert check_coverage(held_out, expected_tiles=16) == 16
+    assert check_coverage(held_out, expected_tile_ids=SYNTHETIC_TILE_IDS) == 16
 
 
 def test_a_tile_held_out_twice_is_refused() -> None:
@@ -182,8 +216,8 @@ def test_a_tile_held_out_twice_is_refused() -> None:
 
 def test_coverage_short_of_the_corpus_is_refused() -> None:
     held_out = {1: _predictions(1).query("split == 'test'")}
-    with pytest.raises(ValueError, match="expected 16"):
-        check_coverage(held_out, expected_tiles=16)
+    with pytest.raises(ValueError, match=r"8 never held out"):
+        check_coverage(held_out, expected_tile_ids=SYNTHETIC_TILE_IDS)
 
 
 def test_lift_is_auprc_over_the_scored_positive_rate(tmp_path: Path) -> None:
@@ -205,6 +239,7 @@ def test_summary_skips_undefined_folds_and_says_how_many_it_used() -> None:
     }
 
 
+@pytest.mark.usefixtures("synthetic_scorable_tiles")
 def test_aggregate_over_every_fold(tmp_path: Path) -> None:
     results = aggregate(TrainingConfig(), _fold_manifest(), _fold_results(tmp_path))
 
@@ -216,6 +251,7 @@ def test_aggregate_over_every_fold(tmp_path: Path) -> None:
     assert "confidence_interval_95" not in json.dumps(results["summary"])
 
 
+@pytest.mark.usefixtures("synthetic_scorable_tiles")
 def test_aggregate_refuses_missing_folds_unless_told_it_is_partial(tmp_path: Path) -> None:
     partial = _fold_results(tmp_path, folds=(1,))
     with pytest.raises(ValueError, match="missing for fold"):
@@ -233,14 +269,95 @@ def test_aggregate_refuses_a_fold_scored_against_another_manifest(tmp_path: Path
         aggregate(TrainingConfig(), _fold_manifest(), fold_results)
 
 
-def test_aggregate_refuses_when_the_folds_miss_scorable_tiles(tmp_path: Path) -> None:
+def test_aggregate_refuses_when_the_folds_miss_scorable_tiles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.modeling.cross_validation as module
+
+    monkeypatch.setattr(module, "scorable_tile_ids",
+                        lambda *a, **k: SYNTHETIC_TILE_IDS | {"CHN_A_1_1-2_t9"})
+    with pytest.raises(ValueError, match=r"1 never held out .*0 not scorable"):
+        aggregate(TrainingConfig(), _fold_manifest(), _fold_results(tmp_path))
+
+
+def test_coverage_uses_the_labelling_the_folds_were_scored_under(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.modeling.cross_validation as module
+
+    seen = []
+    monkeypatch.setattr(module, "scorable_tile_ids",
+                        lambda *args, **k: seen.append(args[1:]) or set(SYNTHETIC_TILE_IDS))
+    fold_results = _fold_results(tmp_path)
+    for results in fold_results.values():
+        results.update(label_rule="area", eval_min_oocyte_area_fraction=0.25)
+    aggregate(TrainingConfig(min_oocyte_area_fraction=0.05), _fold_manifest(), fold_results)
+    assert seen == [(512, "area", 0.25)]
+
+
+def test_folds_scored_under_different_labellings_are_refused(tmp_path: Path) -> None:
+    fold_results = _fold_results(tmp_path)
+    fold_results[1]["eval_min_oocyte_area_fraction"] = 0.05
+    fold_results[2]["eval_min_oocyte_area_fraction"] = 0.25
+    with pytest.raises(ValueError, match="different labellings"):
+        aggregate(TrainingConfig(), _fold_manifest(), fold_results)
+
+
+def test_a_partial_aggregate_with_mixed_labellings_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.modeling.cross_validation as module
+
+    # The added empty fold fails isolation.
+    monkeypatch.setattr(module, "check_fold_isolation", lambda *a, **k: {})
     manifest = _fold_manifest()
-    for fold in manifest["folds"]:
-        fold["tiles"]["512"], fold["ambiguous"]["512"] = 10, 1
-    with pytest.raises(ValueError, match="expected 18"):
-        aggregate(TrainingConfig(), manifest, _fold_results(tmp_path))
+    manifest["n_folds"] = 3
+    manifest["folds"].append({**manifest["folds"][1], "fold": 3, "specimens": [], "slides": [],
+                              "split_manifest_sha256": "sha-fold3"})
+    fold_results = _fold_results(tmp_path)
+    fold_results[1]["eval_min_oocyte_area_fraction"] = 0.05
+    fold_results[2]["eval_min_oocyte_area_fraction"] = 0.25
+    with pytest.raises(ValueError, match="different labellings"):
+        aggregate(TrainingConfig(), manifest, fold_results, allow_partial=True)
 
 
+@pytest.mark.usefixtures("synthetic_scorable_tiles")
+def test_a_partial_aggregate_still_checks_each_held_out_tile(tmp_path: Path) -> None:
+    fold_results = _fold_results(tmp_path, folds=(1,))
+    path = Path(fold_results[1]["predictions_path"])
+    predictions = pd.read_csv(path)
+    predictions.loc[predictions["tile_id"] == "CHN_A_1_1-2_t0", "tile_id"] = "CHN_A_1_1-2_t9"
+    predictions.to_csv(path, index=False)
+    with pytest.raises(ValueError, match=r"1 never held out .*1 not scorable"):
+        aggregate(TrainingConfig(), _fold_manifest(), fold_results, allow_partial=True)
+
+
+@pytest.mark.usefixtures("synthetic_scorable_tiles")
+def test_a_partial_aggregate_with_complete_folds_passes(tmp_path: Path) -> None:
+    results = aggregate(TrainingConfig(), _fold_manifest(), _fold_results(tmp_path, folds=(1,)),
+                        allow_partial=True)
+    assert results["n_tiles_held_out"] == 8
+
+
+def test_a_fold_from_another_configuration_is_refused(tmp_path: Path) -> None:
+    fold_results = _fold_results(tmp_path)
+    fold_results[2]["run_id"] = fold_config(TrainingConfig(seed=43), _fold_manifest(), 2).run_id()
+    with pytest.raises(ValueError, match="different configuration"):
+        aggregate(TrainingConfig(), _fold_manifest(), fold_results)
+
+
+@pytest.mark.usefixtures("synthetic_scorable_tiles")
+def test_a_substituted_tile_with_the_right_count_is_refused(tmp_path: Path) -> None:
+    fold_results = _fold_results(tmp_path)
+    path = Path(fold_results[2]["predictions_path"])
+    predictions = pd.read_csv(path)
+    predictions.loc[predictions["tile_id"] == "CHN_A_2_1-2_t0", "tile_id"] = "CHN_A_2_1-2_t9"
+    predictions.to_csv(path, index=False)
+    with pytest.raises(ValueError, match=r"1 never held out .*1 not scorable"):
+        aggregate(TrainingConfig(), _fold_manifest(), fold_results)
+
+
+@pytest.mark.usefixtures("synthetic_scorable_tiles")
 def test_a_subset_fold_marks_the_whole_aggregate(tmp_path: Path) -> None:
     fold_results = _fold_results(tmp_path)
     fold_results[1]["is_subset_run"] = True
@@ -267,7 +384,10 @@ def test_real_fold_splits_isolate_specimens_and_cover_every_tile_once() -> None:
         check_fold_isolation(fold_index, manifest, fold["fold"])
         held_out[fold["fold"]] = fold_index.loc[fold_index["split"] == "test"]
 
-    assert check_coverage(held_out, expected_tiles=len(index)) == len(index)
+    from src.modeling.cross_validation import scorable_tile_ids
+
+    expected = scorable_tile_ids(manifest, 512, "area", 0.05)
+    assert check_coverage(held_out, expected_tile_ids=expected) == len(index)
 
 
 @pytest.mark.parametrize(
@@ -278,6 +398,7 @@ def test_real_fold_splits_isolate_specimens_and_cover_every_tile_once() -> None:
         ([1, 2], True, True, False),
         ([1, 2, 3, 4], True, False, False),
         ([5], False, False, True),
+        ([1, 1], False, False, True),
     ],
 )
 def test_a_fold_subset_that_could_not_aggregate_is_refused_before_training(
