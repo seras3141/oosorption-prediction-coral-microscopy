@@ -257,6 +257,12 @@ def aggregate(
                 f"fold {fold} was evaluated against a split manifest other than the one "
                 "this fold manifest records"
             )
+        expected_run_id = fold_config(base, fold_manifest, fold).run_id()
+        if results.get("run_id") != expected_run_id:
+            raise ValueError(
+                f"fold {fold} comes from run {results.get('run_id')}, a different "
+                f"configuration from the one being aggregated ({expected_run_id})"
+            )
         predictions = pd.read_csv(_resolve_repo_path(results["predictions_path"]))
         check_fold_isolation(
             predictions, fold_manifest, fold, required_splits=("val", "test")
@@ -265,8 +271,12 @@ def aggregate(
         per_fold.append(fold_summary(results, fold))
 
     label_rule, area_fraction = scoring_labelling(base, fold_results)
-    expected = None if missing else scorable_tile_ids(
-        fold_manifest, base.tile_size, label_rule, area_fraction
+    held_out_specimens = {
+        specimen for fold in fold_results for specimen in _fold_entry(fold_manifest, fold)["specimens"]
+    }
+    expected = scorable_tile_ids(
+        fold_manifest, base.tile_size, label_rule, area_fraction,
+        specimens=held_out_specimens if missing else None,
     )
     n_held_out = check_coverage(held_out, expected)
 
@@ -319,9 +329,13 @@ def scoring_labelling(
 
 
 def scorable_tile_ids(
-    fold_manifest: dict[str, Any], tile_size: int, label_rule: str, min_oocyte_area_fraction: float
+    fold_manifest: dict[str, Any],
+    tile_size: int,
+    label_rule: str,
+    min_oocyte_area_fraction: float,
+    specimens: set[str] | None = None,
 ) -> set[str]:
-    """Return every tile scorable at this size and labelling."""
+    """Return every tile scorable at this size and labelling, optionally per specimen."""
     from src.modeling.tile_index import load_tile_index, training_rows
 
     # Any fold manifest lists every slide.
@@ -331,7 +345,10 @@ def scorable_tile_ids(
         label_rule=label_rule,
         min_oocyte_area_fraction=min_oocyte_area_fraction,
     )
-    return set(training_rows(index)["tile_id"])
+    scorable = training_rows(index)
+    if specimens is not None:
+        scorable = scorable.loc[scorable["stem"].map(specimen_of).isin(specimens)]
+    return set(scorable["tile_id"])
 
 
 def _fold_entry(fold_manifest: dict[str, Any], fold: int) -> dict[str, Any]:

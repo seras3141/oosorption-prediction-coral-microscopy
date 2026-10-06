@@ -75,7 +75,7 @@ def _predictions(held_out: int, tiles_per_slide: int = 4) -> pd.DataFrame:
 def _results(held_out: int, predictions_path: Path, auprc: float = 0.8,
              positive_rate: float = 0.25) -> dict:
     return {
-        "run_id": f"run-fold{held_out}",
+        "run_id": fold_config(TrainingConfig(), _fold_manifest(), held_out).run_id(),
         "split_manifest_sha256": f"sha-fold{held_out}",
         "decision_threshold": 0.5,
         "threshold_selection": "max_val_f1",
@@ -190,11 +190,16 @@ def test_prediction_log_requires_exact_val_and_test_sets() -> None:
 SYNTHETIC_TILE_IDS = {f"{stem}_t{i}" for stem in STEMS for i in range(4)}
 
 
+def _synthetic_scorable(*args, specimens=None) -> set[str]:
+    return {t for t in SYNTHETIC_TILE_IDS
+            if specimens is None or t.rsplit("_", 2)[0] in specimens}
+
+
 @pytest.fixture
 def synthetic_scorable_tiles(monkeypatch: pytest.MonkeyPatch) -> None:
     import src.modeling.cross_validation as module
 
-    monkeypatch.setattr(module, "scorable_tile_ids", lambda *a: set(SYNTHETIC_TILE_IDS))
+    monkeypatch.setattr(module, "scorable_tile_ids", _synthetic_scorable)
 
 
 def test_coverage_counts_each_held_out_tile_once() -> None:
@@ -246,6 +251,7 @@ def test_aggregate_over_every_fold(tmp_path: Path) -> None:
     assert "confidence_interval_95" not in json.dumps(results["summary"])
 
 
+@pytest.mark.usefixtures("synthetic_scorable_tiles")
 def test_aggregate_refuses_missing_folds_unless_told_it_is_partial(tmp_path: Path) -> None:
     partial = _fold_results(tmp_path, folds=(1,))
     with pytest.raises(ValueError, match="missing for fold"):
@@ -269,7 +275,7 @@ def test_aggregate_refuses_when_the_folds_miss_scorable_tiles(
     import src.modeling.cross_validation as module
 
     monkeypatch.setattr(module, "scorable_tile_ids",
-                        lambda *a: SYNTHETIC_TILE_IDS | {"CHN_A_1_1-2_t9"})
+                        lambda *a, **k: SYNTHETIC_TILE_IDS | {"CHN_A_1_1-2_t9"})
     with pytest.raises(ValueError, match=r"1 never held out .*0 not scorable"):
         aggregate(TrainingConfig(), _fold_manifest(), _fold_results(tmp_path))
 
@@ -281,7 +287,7 @@ def test_coverage_uses_the_labelling_the_folds_were_scored_under(
 
     seen = []
     monkeypatch.setattr(module, "scorable_tile_ids",
-                        lambda *args: seen.append(args[1:]) or set(SYNTHETIC_TILE_IDS))
+                        lambda *args, **k: seen.append(args[1:]) or set(SYNTHETIC_TILE_IDS))
     fold_results = _fold_results(tmp_path)
     for results in fold_results.values():
         results.update(label_rule="area", eval_min_oocyte_area_fraction=0.25)
@@ -313,6 +319,31 @@ def test_a_partial_aggregate_with_mixed_labellings_is_refused(
     fold_results[2]["eval_min_oocyte_area_fraction"] = 0.25
     with pytest.raises(ValueError, match="different labellings"):
         aggregate(TrainingConfig(), manifest, fold_results, allow_partial=True)
+
+
+@pytest.mark.usefixtures("synthetic_scorable_tiles")
+def test_a_partial_aggregate_still_checks_each_held_out_tile(tmp_path: Path) -> None:
+    fold_results = _fold_results(tmp_path, folds=(1,))
+    path = Path(fold_results[1]["predictions_path"])
+    predictions = pd.read_csv(path)
+    predictions.loc[predictions["tile_id"] == "CHN_A_1_1-2_t0", "tile_id"] = "CHN_A_1_1-2_t9"
+    predictions.to_csv(path, index=False)
+    with pytest.raises(ValueError, match=r"1 never held out .*1 not scorable"):
+        aggregate(TrainingConfig(), _fold_manifest(), fold_results, allow_partial=True)
+
+
+@pytest.mark.usefixtures("synthetic_scorable_tiles")
+def test_a_partial_aggregate_with_complete_folds_passes(tmp_path: Path) -> None:
+    results = aggregate(TrainingConfig(), _fold_manifest(), _fold_results(tmp_path, folds=(1,)),
+                        allow_partial=True)
+    assert results["n_tiles_held_out"] == 8
+
+
+def test_a_fold_from_another_configuration_is_refused(tmp_path: Path) -> None:
+    fold_results = _fold_results(tmp_path)
+    fold_results[2]["run_id"] = fold_config(TrainingConfig(seed=43), _fold_manifest(), 2).run_id()
+    with pytest.raises(ValueError, match="different configuration"):
+        aggregate(TrainingConfig(), _fold_manifest(), fold_results)
 
 
 @pytest.mark.usefixtures("synthetic_scorable_tiles")
