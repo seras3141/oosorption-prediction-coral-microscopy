@@ -41,6 +41,9 @@ DEFAULT_ENCODER = PHIKON_V2
 
 ENCODER_INPUT_PX = 224
 SUB_TILE_PX = 512
+# ~2x training magnification; 128 px (~4x) refused.
+SMALL_TILE_PX = 256
+FROZEN_TILE_SIZES = (SMALL_TILE_PX, SUB_TILE_PX, 2 * SUB_TILE_PX)
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -200,7 +203,7 @@ class FrozenEncoderClassifier(nn.Module):
     Raises
     ------
     ValueError
-        If ``tile_size`` is not 512 or 1024.
+        If ``tile_size`` is not one of :data:`FROZEN_TILE_SIZES`.
     """
 
     def __init__(
@@ -212,10 +215,7 @@ class FrozenEncoderClassifier(nn.Module):
         dropout: float = DEFAULT_HEAD_DROPOUT,
     ) -> None:
         super().__init__()
-        if tile_size not in (SUB_TILE_PX, 2 * SUB_TILE_PX):
-            raise ValueError(
-                f"tile_size must be {SUB_TILE_PX} or {2 * SUB_TILE_PX}, got {tile_size}"
-            )
+        encoder_input_px(tile_size)
         self.encoder = encoder
         self.tile_size = tile_size
         self.embedding_dim = embedding_dim
@@ -407,8 +407,10 @@ def encoder_input_px(tile_size: int) -> int:
     quadrant of the 2x2 split arrives at 224, keeping every sub-tile at the ~0.52 um/px
     magnification the backbone was trained on.
     """
-    if tile_size == SUB_TILE_PX:
+    if tile_size in (SMALL_TILE_PX, SUB_TILE_PX):
         return ENCODER_INPUT_PX
     if tile_size == 2 * SUB_TILE_PX:
         return 2 * ENCODER_INPUT_PX
-    raise ValueError(f"tile_size must be {SUB_TILE_PX} or {2 * SUB_TILE_PX}, got {tile_size}")
+    raise ValueError(
+        f"the frozen-encoder arm supports tile sizes {FROZEN_TILE_SIZES}, got {tile_size}"
+    )

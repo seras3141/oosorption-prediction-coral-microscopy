@@ -49,6 +49,7 @@ from src.modeling.encoders import (
 from src.modeling.samplers import ForcedRatioBatchSampler, check_mining_allowed
 from src.modeling.tile_classification_dataset import TileClassificationDataset
 from src.modeling.tile_index import (
+    DEFAULT_SPLIT_MANIFEST,
     LABEL_RULE_AREA,
     LABEL_RULE_CENTROID,
     binary_targets,
@@ -114,6 +115,8 @@ class TrainingConfig:
     max_train_slides: int | None = None
     max_batches_per_epoch: int | None = None
     max_val_tiles: int | None = None
+    split_manifest_path: str = DEFAULT_SPLIT_MANIFEST
+    split_manifest_sha256: str | None = None
     output_dir: str = "data/tile_classifier"
 
     #: Fields that do not change a run's numbers and so stay out of its fingerprint.
@@ -124,6 +127,12 @@ class TrainingConfig:
     #: different worker counts follow different training trajectories, so they must not
     #: share a run id and overwrite each other.
     RUN_ID_EXCLUDED: ClassVar[tuple[str, ...]] = ("output_dir",)
+
+    # Keeps pre-existing M7a run ids unchanged.
+    RUN_ID_OMITTED_AT_DEFAULT: ClassVar[dict[str, Any]] = {
+        "split_manifest_path": DEFAULT_SPLIT_MANIFEST,
+        "split_manifest_sha256": None,
+    }
 
     def __post_init__(self) -> None:
         """Resolve defaults here so the recorded config describes what actually ran.
@@ -167,6 +176,34 @@ class TrainingConfig:
             # differing only in it train on identical labels and must not be filed as
             # separate experiments.
             self.min_oocyte_area_fraction = DEFAULT_MIN_OOCYTE_AREA_FRACTION
+        self.split_manifest_path = _path_relative_to_repo(
+            Path(os.path.normpath(self.split_manifest_path))
+        )
+        self._bind_split_manifest()
+
+    def _bind_split_manifest(self) -> None:
+        """Bind the config to the manifest's contents, refusing a changed file."""
+        # Fold manifests are regenerated in place.
+        if self.split_manifest_path == DEFAULT_SPLIT_MANIFEST:
+            self.split_manifest_sha256 = None
+            return
+        path = _resolve_repo_path(self.split_manifest_path)
+        if not path.exists():
+            if self.split_manifest_sha256 is not None:
+                raise ValueError(
+                    f"{self.split_manifest_path} no longer exists; this run was trained "
+                    f"against a manifest with sha256 {self.split_manifest_sha256}"
+                )
+            return
+        current = hashlib.sha256(path.read_bytes()).hexdigest()
+        if self.split_manifest_sha256 is not None and self.split_manifest_sha256 != current:
+            raise ValueError(
+                f"{self.split_manifest_path} has changed since this run was trained "
+                f"(sha256 {self.split_manifest_sha256[:12]} then, {current[:12]} now); "
+                "its checkpoint describes a different split. Regenerating a fold "
+                "manifest in place does not carry old runs with it."
+            )
+        self.split_manifest_sha256 = current
 
     def run_id(self) -> str:
         """Identify a run by everything that changes its numbers.
@@ -197,6 +234,10 @@ class TrainingConfig:
             key: value
             for key, value in sorted(asdict(self).items())
             if key not in self.RUN_ID_EXCLUDED
+            and not (
+                key in self.RUN_ID_OMITTED_AT_DEFAULT
+                and value == self.RUN_ID_OMITTED_AT_DEFAULT[key]
+            )
         }
         digest = hashlib.sha256(
             json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
@@ -351,6 +392,7 @@ def prepare_splits(config: TrainingConfig) -> dict[str, pd.DataFrame]:
     """
     index = training_rows(
         load_tile_index(
+            split_manifest_path=config.split_manifest_path,
             tile_sizes=(config.tile_size,),
             label_rule=config.label_rule,
             min_oocyte_area_fraction=config.min_oocyte_area_fraction,

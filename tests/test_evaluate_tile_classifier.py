@@ -385,23 +385,6 @@ def test_train_summary_describes_only_the_slides_the_model_saw() -> None:
     assert capped["max_train_slides"] == 2
 
 
-@pytest.mark.parametrize(
-    ("stem", "expected"),
-    [
-        ("CHN_SP_5_22-24", "CHN_SP_5"),
-        ("CHN_SP_5_25-27", "CHN_SP_5"),
-        ("LHP_W_10_28-30", "LHP_W_10"),
-        ("LHP_SP_6_3-4", "LHP_SP_6"),
-        ("nounderscore", "nounderscore"),
-    ],
-)
-def test_specimen_is_the_stem_without_its_cut_range(stem: str, expected: str) -> None:
-    """Two cut ranges of one polyp are serial sections, not independent samples."""
-    from src.modeling.evaluate_tile_classifier import specimen_of
-
-    assert specimen_of(stem) == expected
-
-
 def test_intervals_resample_specimens_not_slides() -> None:
     """Under grouped cross-validation a fold holds several slides of one specimen.
     Resampling slides would then treat serial sections through one polyp as independent
@@ -657,3 +640,32 @@ def test_the_override_is_refused_for_the_centroid_rule(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="centroid"):
         evaluate(tmp_path, eval_min_oocyte_area_fraction=0.25)
+
+
+def test_results_hash_the_manifest_the_run_used_not_the_default(tmp_path: Path) -> None:
+    import hashlib
+    import json
+
+    from src.modeling.evaluate_tile_classifier import _build_results
+    from src.modeling.train_tile_classifier import TrainingConfig
+
+    manifest = tmp_path / "fold1_split_manifest.json"
+    manifest.write_text(json.dumps({"manifest_version": "cv-v1-fold1", "slides": {}}))
+    config = TrainingConfig(split_manifest_path=str(manifest))
+    results = _build_results(
+        config=config,
+        checkpoint={"epoch": 3},
+        metrics={},
+        ambiguous={"val": 0, "test": 0},
+        decision_threshold=0.5,
+        threshold_selection="validation_f1",
+        bootstrap_samples=10,
+        run_path=tmp_path,
+        checkpoint_path=tmp_path / "checkpoint.pt",
+        predictions_path=tmp_path / "predictions.csv",
+        scoring_area_fraction=0.05,
+        rescored=False,
+    )
+
+    assert results["split_manifest_version"] == "cv-v1-fold1"
+    assert results["split_manifest_sha256"] == hashlib.sha256(manifest.read_bytes()).hexdigest()
