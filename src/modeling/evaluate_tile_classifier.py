@@ -38,7 +38,7 @@ import json
 import math
 import logging
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
@@ -65,9 +65,13 @@ from src.modeling.train_tile_classifier import (
     build_model,
     build_transforms,
     input_px_for,
+    load_config_cache,
     normalisation_for,
     seed_everything,
 )
+
+if TYPE_CHECKING:
+    from src.modeling.embedding_cache import EmbeddingCache
 
 LOG = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -225,7 +229,8 @@ def evaluate(
         else f"caller-supplied threshold {decision_threshold:.4f}",
     )
 
-    model = _restore_model(config, checkpoint)
+    cache = load_config_cache(config) if config.embedding_cache_dir else None
+    model = _restore_model(config, checkpoint, cache)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device).eval()
 
@@ -265,7 +270,7 @@ def evaluate(
         if frame.empty:
             raise ValueError(f"the {split} split has no tiles at {config.tile_size} px")
         scored_splits[split] = frame.assign(
-            prob=_predict(model, frame, config, device, num_workers)
+            prob=_predict(model, frame, config, device, num_workers, cache)
         )
 
     validation = scored_splits["val"]
@@ -325,7 +330,9 @@ def evaluate(
     return results
 
 
-def _restore_model(config: TrainingConfig, checkpoint: dict[str, Any]) -> torch.nn.Module:
+def _restore_model(
+    config: TrainingConfig, checkpoint: dict[str, Any], cache: EmbeddingCache | None = None
+) -> torch.nn.Module:
     """Rebuild the trained model from a checkpoint, head-only or whole.
 
     The frozen arm stores only its head, so the backbone is reloaded from the local
@@ -335,7 +342,7 @@ def _restore_model(config: TrainingConfig, checkpoint: dict[str, Any]) -> torch.
     scope = checkpoint.get("state_dict_scope", "model")
     state = checkpoint["model_state_dict"]
     if scope == "head" and config.embedding_cache_dir:
-        model = build_model(config)
+        model = build_model(config, cache=cache)
         model.head.load_state_dict(state)
         return model
     if scope == "head":
@@ -361,12 +368,13 @@ def _predict(
     config: TrainingConfig,
     device: torch.device,
     num_workers: int,
+    cache: EmbeddingCache | None = None,
 ) -> np.ndarray:
     """Predicted positive probability per row, in the frame's own order."""
     if config.embedding_cache_dir:
-        from src.modeling.embedding_cache import CachedEmbeddingDataset, load_cache
+        from src.modeling.embedding_cache import CachedEmbeddingDataset
 
-        cache = load_cache(config.embedding_cache_dir, config.tile_size, config.encoder_name)
+        cache = cache if cache is not None else load_config_cache(config)
         dataset = CachedEmbeddingDataset(frame, cache, config.quadrant_pooling)
     else:
         mean, std = normalisation_for(config)

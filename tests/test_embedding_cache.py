@@ -230,8 +230,14 @@ def test_a_head_trains_and_evaluates_from_the_cache(
         epochs=2, patience=5, batch_size=4, num_workers=0, split_manifest_path=str(manifest),
         output_dir=str(tmp_path / "runs"),
     )
+    loads = []
+    real_load = embedding_cache.load_cache
+    monkeypatch.setattr(embedding_cache, "load_cache",
+                        lambda *args, **kwargs: loads.append(args) or real_load(*args, **kwargs))
     result = train(config)
+    assert len(loads) == 1
     results = evaluate(tmp_path / "runs" / result.run_id, bootstrap_samples=5, num_workers=0)
+    assert len(loads) == 2
 
     assert results["augmentation"] == "none (cached embeddings)"
     assert results["embedding_cache"]["meta_sha256"] == config.embedding_cache_sha256
@@ -272,7 +278,7 @@ def test_a_removed_manifest_or_hash_record_is_refused(manifest_backed) -> None:
     hashes = path / embedding_cache.MANIFEST_HASHES_FILE
     recorded = hashes.read_text()
     hashes.unlink()
-    with pytest.raises(ValueError, match="rebuild"):
+    with pytest.raises(ValueError, match="has no tile_manifests.sha256.json; rebuild it"):
         load_cache(path, 512, ENCODER)
     hashes.write_text(recorded)
     manifest.unlink()
@@ -306,21 +312,29 @@ def test_a_failed_swap_keeps_the_previous_cache(
     assert sorted(p.name for p in path.parent.iterdir()) == [path.name]
 
 
-def test_a_manifest_rewritten_during_encoding_invalidates_the_cache(
-    manifest_backed, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("retile", ["rewrite", "delete", "unreadable"])
+def test_a_manifest_rewritten_during_encoding_fails_the_build_and_keeps_the_old_cache(
+    manifest_backed, monkeypatch: pytest.MonkeyPatch, retile: str
 ) -> None:
     path, manifest, tiles = manifest_backed
+    meta_before = (path / "meta.json").read_bytes()
     real_forward = _StubEncoder.forward
 
     def retiling_forward(self, images):
-        manifest.write_text('{"tiles": 3}')
+        if retile == "rewrite":
+            manifest.write_text('{"tiles": 3}')
+        elif manifest.is_file():
+            manifest.unlink()
+            if retile == "unreadable":
+                manifest.mkdir()
         return real_forward(self, images)
 
     monkeypatch.setattr(_StubEncoder, "forward", retiling_forward)
-    build_cache(ENCODER, 512, path.parent.parent, batch_size=4, num_workers=0,
-                tiles=tiles, device="cpu")
-    with pytest.raises(ValueError, match="changed since the cache was built"):
-        load_cache(path, 512, ENCODER)
+    with pytest.raises(ValueError, match="changed while the cache was built"):
+        build_cache(ENCODER, 512, path.parent.parent, batch_size=4, num_workers=0,
+                    tiles=tiles.head(3), device="cpu")
+    assert (path / "meta.json").read_bytes() == meta_before
+    assert sorted(p.name for p in path.parent.iterdir()) == [path.name]
 
 
 def test_a_rebuild_over_rewritten_manifests_changes_the_meta_hash(manifest_backed) -> None:
@@ -335,5 +349,133 @@ def test_a_rebuild_over_rewritten_manifests_changes_the_meta_hash(manifest_backe
 
     hashes = path / embedding_cache.MANIFEST_HASHES_FILE
     hashes.write_text(hashes.read_text().replace('"data', '"./data'))
-    with pytest.raises(ValueError, match="does not match the hash"):
+    with pytest.raises(ValueError, match="does not match its recorded hash"):
         load_cache(path, 512, ENCODER)
+
+
+def test_replaced_embeddings_of_the_same_shape_are_refused(built) -> None:
+    path, _ = built
+    embeddings = np.load(path / "embeddings.npy")
+    np.save(path / "embeddings.npy", embeddings + 1)
+    with pytest.raises(ValueError, match="embeddings.npy does not match its recorded hash"):
+        load_cache(path, 512, ENCODER)
+
+
+def test_a_rebuild_with_other_embeddings_changes_the_meta_hash(
+    built, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, tiles = built
+    meta_before = (path / "meta.json").read_bytes()
+    real_forward = _StubEncoder.forward
+    monkeypatch.setattr(_StubEncoder, "forward", lambda self, images: real_forward(self, images) + 1)
+    build_cache(ENCODER, 512, path.parent.parent, batch_size=4, num_workers=0,
+                tiles=tiles, device="cpu")
+    assert (path / "meta.json").read_bytes() != meta_before
+
+
+def _as_legacy(path: Path) -> str:
+    meta = json.loads((path / "meta.json").read_text())
+    meta["format_version"] = 1
+    del meta["embeddings_sha256"], meta["tile_manifest_hashes_sha256"]
+    (path / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+    return embedding_cache.hashlib.sha256((path / "meta.json").read_bytes()).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    return embedding_cache.hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_a_legacy_cache_without_recorded_bindings_is_refused(
+    manifest_backed, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, _, _ = manifest_backed
+    _as_legacy(path)
+    monkeypatch.setattr(embedding_cache, "LEGACY_CACHE_BINDINGS", {})
+    with pytest.raises(ValueError, match="rebuild it"):
+        load_cache(path, 512, ENCODER)
+
+
+def test_a_legacy_cache_is_bound_through_the_code_table(
+    manifest_backed, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, manifest, _ = manifest_backed
+    sidecar = path / embedding_cache.MANIFEST_HASHES_FILE
+    monkeypatch.setattr(embedding_cache, "LEGACY_CACHE_BINDINGS", {_as_legacy(path): {
+        "tile_manifest_hashes_sha256": _file_sha256(sidecar),
+        "embeddings_sha256": _file_sha256(path / "embeddings.npy"),
+    }})
+    load_cache(path, 512, ENCODER)
+
+    manifest.write_text('{"tiles": 2}')
+    relative = next(iter(json.loads(sidecar.read_text())))
+    sidecar.write_text(json.dumps({relative: _file_sha256(manifest)}, indent=2) + "\n")
+    with pytest.raises(ValueError, match="does not match its recorded hash"):
+        load_cache(path, 512, ENCODER)
+
+
+def test_a_cache_swapped_after_the_config_bound_it_is_refused(
+    built, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.modeling.train_tile_classifier import TrainingConfig, load_config_cache
+
+    path, tiles = built
+    config = TrainingConfig(architecture="frozen_encoder", tile_size=512,
+                            embedding_cache_dir=str(path))
+    real_forward = _StubEncoder.forward
+    monkeypatch.setattr(_StubEncoder, "forward", lambda self, images: real_forward(self, images) + 1)
+    build_cache(ENCODER, 512, path.parent.parent, batch_size=4, num_workers=0,
+                tiles=tiles, device="cpu")
+    with pytest.raises(ValueError, match="rebuilt since"):
+        load_config_cache(config)
+
+
+def test_a_cache_swapped_while_loading_is_refused(
+    built, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import shutil
+
+    path, _ = built
+    real_file_sha256 = embedding_cache.file_sha256
+
+    def swapping_file_sha256(target: Path) -> str:
+        digest = real_file_sha256(target)
+        if target.name == "embeddings.npy" and target.parent == path:
+            shutil.copytree(path, path.with_name("swapped"))
+            shutil.rmtree(path)
+            os.replace(path.with_name("swapped"), path)
+        return digest
+
+    monkeypatch.setattr(embedding_cache, "file_sha256", swapping_file_sha256)
+    with pytest.raises(ValueError, match="replaced while it was loaded"):
+        load_cache(path, 512, ENCODER)
+
+
+@pytest.mark.parametrize(
+    ("change", "match"),
+    [
+        (lambda meta: meta.pop("embeddings_sha256"), "lacks embeddings_sha256; rebuild it"),
+        (lambda meta: meta.update(format_version=3), "format 3, which this code cannot read"),
+        (lambda meta: meta.pop("format_version"), "format None, which this code cannot read"),
+        (lambda meta: (meta.clear(), meta.update(format_version=3)),
+         "format 3, which this code cannot read"),
+    ],
+)
+def test_an_unreadable_cache_format_is_refused(built, change, match: str) -> None:
+    path, _ = built
+    meta = json.loads((path / "meta.json").read_text())
+    change(meta)
+    (path / "meta.json").write_text(json.dumps(meta))
+    with pytest.raises(ValueError, match=match):
+        load_cache(path, 512, ENCODER)
+
+
+def test_a_config_made_before_its_cache_existed_is_refused(tmp_path: Path, stub_encoder) -> None:
+    from src.modeling.train_tile_classifier import TrainingConfig, load_config_cache
+
+    root = tmp_path / "cache"
+    config = TrainingConfig(architecture="frozen_encoder", tile_size=512,
+                            embedding_cache_dir=str(embedding_cache.cache_dir(ENCODER, 512, root)))
+    build_cache(ENCODER, 512, root, batch_size=4, num_workers=0,
+                tiles=_tiles(tmp_path, 512), device="cpu")
+    with pytest.raises(ValueError, match="created before its embedding cache existed"):
+        load_config_cache(config)

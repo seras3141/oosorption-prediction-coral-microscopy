@@ -23,12 +23,28 @@ from src.modeling.tile_index import LABEL_RULE_CENTROID, _resolve_repo_path, loa
 LOG = logging.getLogger(__name__)
 
 DEFAULT_CACHE_ROOT = "data/embedding_cache"
-CACHE_FORMAT_VERSION = 1
+CACHE_FORMAT_VERSION = 2
 POOLINGS = ("mean", "max")
 EMBEDDINGS_FILE = "embeddings.npy"
 TILES_FILE = "tiles.csv"
 META_FILE = "meta.json"
 MANIFEST_HASHES_FILE = "tile_manifests.sha256.json"
+CONTENT_BINDINGS = ("tile_manifest_hashes_sha256", "embeddings_sha256")
+# Format-1 meta.json is run-id-bound; never rewritten.
+LEGACY_CACHE_BINDINGS = {
+    "54909588b8d0c03b52d1fd2bc48e30d377295f1ec15089b5050661c62d622dae": {
+        "tile_manifest_hashes_sha256": "d50efadb6d354dff9addccc803927036b1346aa50977d2c0198c6823c256cf1b",
+        "embeddings_sha256": "e1933129b5fc06d4df797d6b04d564be1dfe17a795a16b888d27b0650be51396",
+    },
+    "32365347daa254eff5405e62ba4524781aa8d4d021ee4b8ee0231748d58b4a27": {
+        "tile_manifest_hashes_sha256": "d50efadb6d354dff9addccc803927036b1346aa50977d2c0198c6823c256cf1b",
+        "embeddings_sha256": "de8a38f5bc61e3179a536b5318aca8ec9cdb828794481db16a0b34672836212d",
+    },
+    "a8210ccd0345b961b2b19816fe2fc16cc0c774110c8d629c64d3c2e0c60eecaf": {
+        "tile_manifest_hashes_sha256": "d50efadb6d354dff9addccc803927036b1346aa50977d2c0198c6823c256cf1b",
+        "embeddings_sha256": "4b1d3f12e0ada49cc89650f5d6e24823d3639015b047e4943bbb6498ab33fc30",
+    },
+}
 
 
 def cache_dir(encoder_name: str, tile_size: int, root: str | Path = DEFAULT_CACHE_ROOT) -> Path:
@@ -57,11 +73,16 @@ def tile_manifest_stats(frame: pd.DataFrame) -> dict[str, list[int]]:
     return stats
 
 
+def file_sha256(path: Path) -> str:
+    """SHA-256 of a file's contents, read in chunks."""
+    with path.open("rb") as fp:
+        return hashlib.file_digest(fp, "sha256").hexdigest()
+
+
 def tile_manifest_sha256(relative_paths: list[str]) -> dict[str, str]:
     """Content hash of each tile manifest; re-tiling rewrites them."""
     return {
-        relative: hashlib.sha256(_resolve_repo_path(relative).read_bytes()).hexdigest()
-        for relative in sorted(relative_paths)
+        relative: file_sha256(_resolve_repo_path(relative)) for relative in sorted(relative_paths)
     }
 
 
@@ -169,10 +190,20 @@ def build_cache(
         "tile_list_sha256": tile_list_sha256(frame),
         "tile_manifests": manifests,
         "tile_manifest_hashes_sha256": hashlib.sha256(hashes_bytes).hexdigest(),
+        "embeddings_sha256": file_sha256(staging / EMBEDDINGS_FILE),
     }
     (staging / META_FILE).write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     (staging / MANIFEST_HASHES_FILE).write_bytes(hashes_bytes)
 
+    try:
+        unchanged = tile_manifest_sha256(list(manifests)) == manifest_hashes
+    except OSError:
+        unchanged = False
+    if not unchanged:
+        shutil.rmtree(staging)
+        raise ValueError(
+            f"tile manifests changed while the cache was built; {out_dir} was left as it was"
+        )
     _swap_into_place(staging, out_dir)
     LOG.info("Wrote %s (%d tiles x %d x %d)", out_dir, len(frame), n_sub, model.embedding_dim)
     return out_dir
@@ -184,6 +215,7 @@ class EmbeddingCache:
 
     path: Path
     meta: dict[str, Any]
+    meta_sha256: str
     embeddings: np.ndarray
     rows: dict[str, int]
     png_paths: list[str]
@@ -216,7 +248,23 @@ def load_cache(
     root = _resolve_repo_path(path)
     if not (root / META_FILE).exists():
         raise ValueError(f"{root} is not an embedding cache (no {META_FILE})")
-    meta = json.loads((root / META_FILE).read_text(encoding="utf-8"))
+    # Rebuilds swap directories, changing the inode.
+    identity = root.stat().st_ino
+    meta_bytes = (root / META_FILE).read_bytes()
+    meta = json.loads(meta_bytes)
+    meta_sha256 = hashlib.sha256(meta_bytes).hexdigest()
+    version = meta.get("format_version")
+    if version == CACHE_FORMAT_VERSION:
+        for key in CONTENT_BINDINGS:
+            if key not in meta:
+                raise ValueError(f"{root}: {META_FILE} lacks {key}; rebuild it")
+        bindings = {key: meta[key] for key in CONTENT_BINDINGS}
+    elif version == 1:
+        bindings = LEGACY_CACHE_BINDINGS.get(meta_sha256)
+        if bindings is None:
+            raise ValueError(f"{root} predates content-bound caches; rebuild it")
+    else:
+        raise ValueError(f"{root} is cache format {version}, which this code cannot read")
     if tile_size is not None and meta["tile_size"] != tile_size:
         raise ValueError(f"{root} caches {meta['tile_size']} px tiles, not {tile_size} px")
     if encoder_name is not None and meta["encoder_name"] != encoder_name:
@@ -236,26 +284,28 @@ def load_cache(
         raise ValueError(f"{root}: {TILES_FILE} does not match the hash in {META_FILE}")
     if not (root / MANIFEST_HASHES_FILE).exists():
         raise ValueError(f"{root} has no {MANIFEST_HASHES_FILE}; rebuild it")
-    hashes_bytes = (root / MANIFEST_HASHES_FILE).read_bytes()
-    bound = meta.get("tile_manifest_hashes_sha256")
-    # The three Phikon-v2 caches predate this binding.
-    if bound is not None and hashlib.sha256(hashes_bytes).hexdigest() != bound:
-        raise ValueError(f"{root}: {MANIFEST_HASHES_FILE} does not match the hash in {META_FILE}")
-    hashes = json.loads(hashes_bytes)
+    for name, key in ((MANIFEST_HASHES_FILE, "tile_manifest_hashes_sha256"),
+                      (EMBEDDINGS_FILE, "embeddings_sha256")):
+        if file_sha256(root / name) != bindings[key]:
+            raise ValueError(f"{root}: {name} does not match its recorded hash; rebuild it")
+    hashes = json.loads((root / MANIFEST_HASHES_FILE).read_bytes())
     if set(hashes) != set(meta.get("tile_manifests", {})):
         raise ValueError(f"{root}: {MANIFEST_HASHES_FILE} lists other manifests than {META_FILE}")
     for relative, recorded in hashes.items():
         manifest = _resolve_repo_path(relative)
         if not manifest.exists():
             raise ValueError(f"{root}: {relative} is gone; the tiles were regenerated")
-        if hashlib.sha256(manifest.read_bytes()).hexdigest() != recorded:
+        if file_sha256(manifest) != recorded:
             raise ValueError(f"{root}: {relative} changed since the cache was built; rebuild it")
     embeddings = np.load(root / EMBEDDINGS_FILE, mmap_mode="r")
     if embeddings.shape != (meta["n_tiles"], meta["n_sub_tiles"], meta["embedding_dim"]):
         raise ValueError(f"{root}: embeddings shape {embeddings.shape} disagrees with {META_FILE}")
+    if root.stat().st_ino != identity:
+        raise ValueError(f"{root} was replaced while it was loaded; load it again")
     return EmbeddingCache(
         path=root,
         meta=meta,
+        meta_sha256=meta_sha256,
         embeddings=embeddings,
         rows={tile_id: row for row, tile_id in enumerate(frame["tile_id"])},
         png_paths=list(frame["png_path"]),

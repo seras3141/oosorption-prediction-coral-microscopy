@@ -28,7 +28,7 @@ import time
 import hashlib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import pandas as pd
@@ -59,6 +59,9 @@ from src.modeling.tile_index import (
     training_rows,
 )
 from src.modeling.tile_labels import DEFAULT_MIN_OOCYTE_AREA_FRACTION, LABEL_POSITIVE
+
+if TYPE_CHECKING:
+    from src.modeling.embedding_cache import EmbeddingCache
 
 LOG = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -389,7 +392,9 @@ def build_transforms(
     return transforms.Compose(steps)
 
 
-def build_model(config: TrainingConfig, pretrained: bool = True) -> nn.Module:
+def build_model(
+    config: TrainingConfig, pretrained: bool = True, cache: EmbeddingCache | None = None
+) -> nn.Module:
     """Build the classifier for the configured architecture.
 
     Returns a model whose forward gives one logit per tile.
@@ -411,9 +416,7 @@ def build_model(config: TrainingConfig, pretrained: bool = True) -> nn.Module:
         model.fc = nn.Linear(model.fc.in_features, 1)
         return model
     if config.architecture == ARCHITECTURE_FROZEN_ENCODER and config.embedding_cache_dir:
-        from src.modeling.embedding_cache import load_cache
-
-        cache = load_cache(config.embedding_cache_dir, config.tile_size, config.encoder_name)
+        cache = cache if cache is not None else load_config_cache(config)
         return EmbeddingHead(cache.embedding_dim, config.head_hidden_dim, config.head_dropout)
     if config.architecture == ARCHITECTURE_FROZEN_ENCODER:
         return load_encoder(
@@ -423,6 +426,24 @@ def build_model(config: TrainingConfig, pretrained: bool = True) -> nn.Module:
             dropout=config.head_dropout,
         )
     raise ValueError(f"architecture must be one of {ARCHITECTURES}")
+
+
+def load_config_cache(config: TrainingConfig) -> EmbeddingCache:
+    """Open the run's embedding cache, checked against its tile size and encoder."""
+    from src.modeling.embedding_cache import load_cache
+
+    cache = load_cache(config.embedding_cache_dir, config.tile_size, config.encoder_name)
+    if config.embedding_cache_sha256 is None:
+        raise ValueError(
+            f"this run's config was created before its embedding cache existed at "
+            f"{config.embedding_cache_dir}; create the config again"
+        )
+    if cache.meta_sha256 != config.embedding_cache_sha256:
+        raise ValueError(
+            f"the embedding cache at {config.embedding_cache_dir} was rebuilt since this "
+            "run was configured; its run id describes different embeddings"
+        )
+    return cache
 
 
 def prepare_splits(config: TrainingConfig) -> dict[str, pd.DataFrame]:
@@ -529,7 +550,8 @@ def train(config: TrainingConfig) -> TrainingResult:
     # multi-GB weight load rather than a cheap construction, but a bad architecture,
     # encoder or tile size should still surface before the index is parsed -- and
     # load_encoder validates all three before fetching anything.
-    model = build_model(config)
+    cache = load_config_cache(config) if config.embedding_cache_dir else None
+    model = build_model(config, cache=cache)
 
     run_dir = _resolve_repo_path(config.output_dir) / config.run_id()
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -574,8 +596,8 @@ def train(config: TrainingConfig) -> TrainingResult:
     superseded_purged = False
 
     splits = prepare_splits(config)
-    if config.embedding_cache_dir:
-        train_dataset, scoring_dataset, val_dataset = _cached_datasets(config, splits)
+    if cache is not None:
+        train_dataset, scoring_dataset, val_dataset = _cached_datasets(config, splits, cache)
     else:
         train_dataset, scoring_dataset, val_dataset = _image_datasets(config, splits)
 
@@ -753,12 +775,11 @@ def _image_datasets(
 
 
 def _cached_datasets(
-    config: TrainingConfig, splits: dict[str, pd.DataFrame]
+    config: TrainingConfig, splits: dict[str, pd.DataFrame], cache: EmbeddingCache
 ) -> tuple[TileClassificationDataset, TileClassificationDataset, TileClassificationDataset]:
     """Train, scoring and validation datasets over cached embeddings."""
-    from src.modeling.embedding_cache import CachedEmbeddingDataset, load_cache
+    from src.modeling.embedding_cache import CachedEmbeddingDataset
 
-    cache = load_cache(config.embedding_cache_dir, config.tile_size, config.encoder_name)
     LOG.info("Cached embeddings from %s, %s pooling", cache.path, config.quadrant_pooling)
     train_dataset = CachedEmbeddingDataset(splits["train"], cache, config.quadrant_pooling)
     # No augmentation: mining scores the train set.
