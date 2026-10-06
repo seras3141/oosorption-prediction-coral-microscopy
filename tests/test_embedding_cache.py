@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -237,22 +238,102 @@ def test_a_head_trains_and_evaluates_from_the_cache(
     assert results["metrics"]["test"]["n_tiles"] == 3
 
 
-def test_a_rewritten_tile_manifest_invalidates_the_cache(
-    tmp_path: Path, stub_encoder, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import os
-
+@pytest.fixture
+def manifest_backed(tmp_path: Path, stub_encoder, monkeypatch: pytest.MonkeyPatch):
     manifest = tmp_path / "data/tiles/S_A_1_1-2/S_A_1_1-2_cut000/S_A_1_1-2_cut000_tile_manifest.json"
     manifest.parent.mkdir(parents=True)
-    manifest.write_text("{}")
+    manifest.write_text('{"tiles": 1}')
     monkeypatch.setattr(embedding_cache, "_resolve_repo_path",
                         lambda p: Path(p) if Path(p).is_absolute() else tmp_path / p)
     tiles = _tiles(tmp_path, 512).assign(cut_name="S_A_1_1-2_cut000")
     path = build_cache(ENCODER, 512, tmp_path / "cache", batch_size=4, num_workers=0,
                        tiles=tiles, device="cpu")
     load_cache(path, 512, ENCODER)
+    return path, manifest, tiles
 
-    manifest.write_text('{"regenerated": true}')
-    os.utime(manifest, ns=(1, 1))
+
+def test_a_same_size_rewrite_with_the_old_mtime_invalidates_the_cache(manifest_backed) -> None:
+    path, manifest, _ = manifest_backed
+    before = manifest.stat()
+    manifest.write_text('{"tiles": 2}')
+    os.utime(manifest, ns=(before.st_atime_ns, before.st_mtime_ns))
     with pytest.raises(ValueError, match="changed since the cache was built"):
+        load_cache(path, 512, ENCODER)
+
+
+def test_a_touched_but_unchanged_manifest_keeps_the_cache(manifest_backed) -> None:
+    path, manifest, _ = manifest_backed
+    os.utime(manifest, ns=(1, 1))
+    load_cache(path, 512, ENCODER)
+
+
+def test_a_removed_manifest_or_hash_record_is_refused(manifest_backed) -> None:
+    path, manifest, _ = manifest_backed
+    hashes = path / embedding_cache.MANIFEST_HASHES_FILE
+    recorded = hashes.read_text()
+    hashes.unlink()
+    with pytest.raises(ValueError, match="rebuild"):
+        load_cache(path, 512, ENCODER)
+    hashes.write_text(recorded)
+    manifest.unlink()
+    with pytest.raises(ValueError, match="is gone"):
+        load_cache(path, 512, ENCODER)
+
+
+def test_a_failed_swap_keeps_the_previous_cache(
+    manifest_backed, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, _, tiles = manifest_backed
+    original = (path / "meta.json").read_text()
+    real_replace = os.replace
+
+    def failing_replace(src, dst):
+        if Path(src).name.endswith(".partial"):
+            raise OSError("simulated failure")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(embedding_cache.os, "replace", failing_replace)
+    with pytest.raises(OSError, match="simulated"):
+        build_cache(ENCODER, 512, path.parent.parent, batch_size=4, num_workers=0,
+                    tiles=tiles.head(3), device="cpu")
+    assert (path / "meta.json").read_text() == original
+    assert load_cache(path, 512, ENCODER).meta["n_tiles"] == 6
+
+    monkeypatch.setattr(embedding_cache.os, "replace", real_replace)
+    build_cache(ENCODER, 512, path.parent.parent, batch_size=4, num_workers=0,
+                tiles=tiles.head(3), device="cpu")
+    assert load_cache(path, 512, ENCODER).meta["n_tiles"] == 3
+    assert sorted(p.name for p in path.parent.iterdir()) == [path.name]
+
+
+def test_a_manifest_rewritten_during_encoding_invalidates_the_cache(
+    manifest_backed, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path, manifest, tiles = manifest_backed
+    real_forward = _StubEncoder.forward
+
+    def retiling_forward(self, images):
+        manifest.write_text('{"tiles": 3}')
+        return real_forward(self, images)
+
+    monkeypatch.setattr(_StubEncoder, "forward", retiling_forward)
+    build_cache(ENCODER, 512, path.parent.parent, batch_size=4, num_workers=0,
+                tiles=tiles, device="cpu")
+    with pytest.raises(ValueError, match="changed since the cache was built"):
+        load_cache(path, 512, ENCODER)
+
+
+def test_a_rebuild_over_rewritten_manifests_changes_the_meta_hash(manifest_backed) -> None:
+    path, manifest, tiles = manifest_backed
+    meta_before = (path / "meta.json").read_bytes()
+    before = manifest.stat()
+    manifest.write_text('{"tiles": 2}')
+    os.utime(manifest, ns=(before.st_atime_ns, before.st_mtime_ns))
+    build_cache(ENCODER, 512, path.parent.parent, batch_size=4, num_workers=0,
+                tiles=tiles, device="cpu")
+    assert (path / "meta.json").read_bytes() != meta_before
+
+    hashes = path / embedding_cache.MANIFEST_HASHES_FILE
+    hashes.write_text(hashes.read_text().replace('"data', '"./data'))
+    with pytest.raises(ValueError, match="does not match the hash"):
         load_cache(path, 512, ENCODER)

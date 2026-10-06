@@ -28,6 +28,7 @@ POOLINGS = ("mean", "max")
 EMBEDDINGS_FILE = "embeddings.npy"
 TILES_FILE = "tiles.csv"
 META_FILE = "meta.json"
+MANIFEST_HASHES_FILE = "tile_manifests.sha256.json"
 
 
 def cache_dir(encoder_name: str, tile_size: int, root: str | Path = DEFAULT_CACHE_ROOT) -> Path:
@@ -45,7 +46,7 @@ def tile_list_sha256(frame: pd.DataFrame) -> str:
 
 
 def tile_manifest_stats(frame: pd.DataFrame) -> dict[str, list[int]]:
-    """Size and mtime of each tile manifest behind ``frame``; re-tiling rewrites them."""
+    """Size and mtime of each tile manifest behind ``frame``, kept as provenance."""
     if "cut_name" not in frame.columns:
         return {}
     stats = {}
@@ -54,6 +55,31 @@ def tile_manifest_stats(frame: pd.DataFrame) -> dict[str, list[int]]:
         info = _resolve_repo_path(relative).stat()
         stats[relative] = [info.st_size, info.st_mtime_ns]
     return stats
+
+
+def tile_manifest_sha256(relative_paths: list[str]) -> dict[str, str]:
+    """Content hash of each tile manifest; re-tiling rewrites them."""
+    return {
+        relative: hashlib.sha256(_resolve_repo_path(relative).read_bytes()).hexdigest()
+        for relative in sorted(relative_paths)
+    }
+
+
+def _swap_into_place(staging: Path, out_dir: Path) -> None:
+    """Replace ``out_dir`` with ``staging``, restoring the old cache if the move fails."""
+    previous = out_dir.with_name(out_dir.name + ".previous")
+    if out_dir.exists():
+        if previous.exists():
+            shutil.rmtree(previous)
+        os.replace(out_dir, previous)
+    try:
+        os.replace(staging, out_dir)
+    except OSError:
+        if previous.exists():
+            os.replace(previous, out_dir)
+        raise
+    if previous.exists():
+        shutil.rmtree(previous)
 
 
 def local_encoder_revision(encoder_name: str) -> str | None:
@@ -89,6 +115,8 @@ def build_cache(
     from src.modeling.train_tile_classifier import build_transforms
 
     frame = cache_tiles(tile_size) if tiles is None else tiles.reset_index(drop=True)
+    manifests = tile_manifest_stats(frame)
+    manifest_hashes = tile_manifest_sha256(list(manifests))
     model = load_encoder(encoder_name=encoder_name, tile_size=tile_size)
     spec = encoder_spec(encoder_name)
     target = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -124,6 +152,7 @@ def build_cache(
     del embeddings
 
     frame[["tile_id", "png_path"]].to_csv(staging / TILES_FILE, index=False)
+    hashes_bytes = (json.dumps(manifest_hashes, indent=2) + "\n").encode("utf-8")
     meta = {
         "format_version": CACHE_FORMAT_VERSION,
         "created": date.today().isoformat(),
@@ -138,13 +167,13 @@ def build_cache(
         "dtype": "float32",
         "augmentation": "none",
         "tile_list_sha256": tile_list_sha256(frame),
-        "tile_manifests": tile_manifest_stats(frame),
+        "tile_manifests": manifests,
+        "tile_manifest_hashes_sha256": hashlib.sha256(hashes_bytes).hexdigest(),
     }
     (staging / META_FILE).write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    (staging / MANIFEST_HASHES_FILE).write_bytes(hashes_bytes)
 
-    if out_dir.exists():
-        shutil.rmtree(out_dir)
-    os.replace(staging, out_dir)
+    _swap_into_place(staging, out_dir)
     LOG.info("Wrote %s (%d tiles x %d x %d)", out_dir, len(frame), n_sub, model.embedding_dim)
     return out_dir
 
@@ -205,12 +234,21 @@ def load_cache(
     frame = pd.DataFrame(listed, columns=["tile_id", "png_path"])
     if tile_list_sha256(frame) != meta["tile_list_sha256"]:
         raise ValueError(f"{root}: {TILES_FILE} does not match the hash in {META_FILE}")
-    for relative, recorded in meta.get("tile_manifests", {}).items():
+    if not (root / MANIFEST_HASHES_FILE).exists():
+        raise ValueError(f"{root} has no {MANIFEST_HASHES_FILE}; rebuild it")
+    hashes_bytes = (root / MANIFEST_HASHES_FILE).read_bytes()
+    bound = meta.get("tile_manifest_hashes_sha256")
+    # The three Phikon-v2 caches predate this binding.
+    if bound is not None and hashlib.sha256(hashes_bytes).hexdigest() != bound:
+        raise ValueError(f"{root}: {MANIFEST_HASHES_FILE} does not match the hash in {META_FILE}")
+    hashes = json.loads(hashes_bytes)
+    if set(hashes) != set(meta.get("tile_manifests", {})):
+        raise ValueError(f"{root}: {MANIFEST_HASHES_FILE} lists other manifests than {META_FILE}")
+    for relative, recorded in hashes.items():
         manifest = _resolve_repo_path(relative)
         if not manifest.exists():
             raise ValueError(f"{root}: {relative} is gone; the tiles were regenerated")
-        info = manifest.stat()
-        if [info.st_size, info.st_mtime_ns] != recorded:
+        if hashlib.sha256(manifest.read_bytes()).hexdigest() != recorded:
             raise ValueError(f"{root}: {relative} changed since the cache was built; rebuild it")
     embeddings = np.load(root / EMBEDDINGS_FILE, mmap_mode="r")
     if embeddings.shape != (meta["n_tiles"], meta["n_sub_tiles"], meta["embedding_dim"]):
