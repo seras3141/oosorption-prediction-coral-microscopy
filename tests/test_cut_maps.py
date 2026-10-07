@@ -267,3 +267,41 @@ def test_oocyte_paths_keep_their_holes() -> None:
     plt.close(fig)
     assert red[10, 10] == 0
     assert red[50, 50] == 255
+
+
+def test_label_and_overlay_maps_do_not_need_torch() -> None:
+    import subprocess
+
+    check = ("import sys; sys.path.insert(0, sys.argv[1]); import src.visualization.cut_maps; "
+             "sys.exit('torch' in sys.modules)")
+    run = subprocess.run([sys.executable, "-c", check, str(REPO_ROOT)],
+                         capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr or "importing cut_maps loaded torch"
+
+
+def test_the_label_caption_states_the_threshold_drawn(cut_dirs) -> None:
+    cuts, tiles = cut_dirs
+    view = load_cut_view(STEM, CUT, tile_sizes=(256,), min_oocyte_area_fraction=0.1,
+                         cuts_dir=cuts, tiles_dir=tiles)
+    captions = [text.get_text() for text in plot_tile_labels(view, 256).texts]
+    assert any("coverage ≥ 0.1 · ambiguous: 0 < coverage < 0.1" in c for c in captions), captions
+
+
+@pytest.mark.parametrize(("threshold", "unpredicted"), [(None, 2), (0.5, 0)])
+def test_a_fold_with_undefined_metrics_still_renders(
+    cut_dirs, tmp_path: Path, threshold: float | None, unpredicted: int
+) -> None:
+    from src.visualization.cut_maps import held_out_predictions
+
+    cuts, tiles = cut_dirs
+    predictions = tmp_path / "predictions.csv"
+    pd.DataFrame({"tile_id": ["t_in", "t_out"], "prob": [0.9, 0.1],
+                  "split": ["test", "test"]}).to_csv(predictions, index=False)
+    cv = tmp_path / "cv_results.json"
+    cv.write_text(json.dumps({"per_fold": [{"fold": 1, "predictions_path": str(predictions),
+                                            "decision_threshold": threshold, "auprc": None}]}))
+    view = load_cut_view(STEM, CUT, tile_sizes=(256,), cuts_dir=cuts, tiles_dir=tiles)
+    fig = plot_prediction_errors(view, 256, held_out_predictions(cv), "M")
+    labels = [text.get_text() for text in fig.legends[0].get_texts()]
+    assert (f"{NO_PREDICTION} {unpredicted}" in labels) == bool(unpredicted)
+    assert any("fold AUPRC nan" in text.get_text() for text in fig.texts)

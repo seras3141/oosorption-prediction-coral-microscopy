@@ -33,8 +33,6 @@ from src.modeling.tile_labels import (
     oocyte_area_fractions_for_manifest,
 )
 from src.modeling.cross_validation import DEFAULT_FOLD_MANIFEST, load_fold_manifest
-from src.modeling.embedding_cache import cache_dir
-from src.modeling.train_tile_classifier import TrainingConfig, _path_relative_to_repo
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CUTS_DIR = REPO_ROOT / "data" / "cuts"
@@ -73,6 +71,7 @@ class CutView:
     polygons: list[BaseGeometry]
     cut_area_level0: float
     tiles: pd.DataFrame
+    min_oocyte_area_fraction: float
 
     @property
     def title(self) -> str:
@@ -134,6 +133,7 @@ def load_cut_view(
         tiles=pd.DataFrame(rows, columns=[
             "tile_id", "tile_size", "x0", "y0", "x1", "y1", "oocyte_area_fraction", "label",
         ]),
+        min_oocyte_area_fraction=min_oocyte_area_fraction,
     )
 
 
@@ -164,9 +164,14 @@ def held_out_predictions(cv_results_path: str | Path) -> pd.DataFrame:
     for fold in cv["per_fold"]:
         predictions = pd.read_csv(REPO_ROOT / fold["predictions_path"])
         held_out = predictions.loc[predictions["split"] == "test", ["tile_id", "prob"]]
-        frames.append(held_out.assign(fold=fold["fold"], threshold=fold["decision_threshold"],
-                                      fold_auprc=fold["auprc"]))
+        frames.append(held_out.assign(fold=fold["fold"],
+                                      threshold=_as_float(fold["decision_threshold"]),
+                                      fold_auprc=_as_float(fold["auprc"])))
     return pd.concat(frames, ignore_index=True).set_index("tile_id")
+
+
+def _as_float(value: float | None) -> float:
+    return float("nan") if value is None else float(value)
 
 
 MODELS = {
@@ -182,16 +187,23 @@ _ABSENT = object()
 
 def default_run_config(model: str, tile_size: int, seed: int = 42) -> dict[str, Any]:
     """The recorded config a run of ``model`` under TrainingConfig's defaults would carry."""
+    # Deferred: label maps need no torch.
+    from src.modeling.embedding_cache import cache_dir
+    from src.modeling.train_tile_classifier import TrainingConfig, _path_relative_to_repo
+
     spec = MODELS[model]
     config = asdict(TrainingConfig(architecture=spec["architecture"],
                                    encoder_name=spec["encoder_name"],
                                    tile_size=tile_size, seed=seed))
     if spec["cached"]:
-        config["embedding_cache_dir"] = _path_relative_to_repo(cache_dir(spec["encoder_name"], tile_size))
+        path = cache_dir(spec["encoder_name"], tile_size)
+        config["embedding_cache_dir"] = _path_relative_to_repo(path)
     return config
 
 
 def _is_default(recorded: dict[str, Any], default: dict[str, Any]) -> bool:
+    from src.modeling.train_tile_classifier import TrainingConfig
+
     omitted = TrainingConfig.RUN_ID_OMITTED_AT_DEFAULT
     keys = (set(recorded) | set(default)) - set(UNCOMPARED_FIELDS)
     return all(
@@ -265,7 +277,8 @@ def plot_tile_labels(view: CutView, tile_size: int) -> plt.Figure:
     _legend(fig, handles)
     _caption(fig, [
         f"{len(tiles):,} tiles kept by the tissue filter",
-        "positive: oocyte coverage ≥ 0.05 · ambiguous: 0 < coverage < 0.05",
+        f"positive: oocyte coverage ≥ {view.min_oocyte_area_fraction:g} · "
+        f"ambiguous: 0 < coverage < {view.min_oocyte_area_fraction:g}",
         "tiles overlap by 20%",
     ])
     return fig
