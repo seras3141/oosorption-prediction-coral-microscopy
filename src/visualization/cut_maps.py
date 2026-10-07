@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,9 @@ from src.modeling.tile_labels import (
     load_annotation_polygons,
     oocyte_area_fractions_for_manifest,
 )
+from src.modeling.cross_validation import DEFAULT_FOLD_MANIFEST, load_fold_manifest
+from src.modeling.embedding_cache import cache_dir
+from src.modeling.train_tile_classifier import TrainingConfig, _path_relative_to_repo
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CUTS_DIR = REPO_ROOT / "data" / "cuts"
@@ -47,14 +50,16 @@ AQUA = "#1baf7a"
 OOCYTE_FILL = AQUA
 
 LABEL_COLOURS = {LABEL_NEGATIVE: BLUE, LABEL_AMBIGUOUS: ORANGE, LABEL_POSITIVE: AQUA}
+LABEL_HATCHES = {LABEL_AMBIGUOUS: "...."}
 
 TRUE_POSITIVE = "true positive"
 FALSE_NEGATIVE = "false negative"
 FALSE_POSITIVE = "false positive"
 TRUE_NEGATIVE = "true negative"
 NOT_SCORED = "not scored (ambiguous)"
-OUTCOME_ORDER = (TRUE_POSITIVE, FALSE_NEGATIVE, FALSE_POSITIVE, TRUE_NEGATIVE, NOT_SCORED)
+NO_PREDICTION = "no prediction"
 OUTCOME_COLOURS = {TRUE_POSITIVE: AQUA, FALSE_NEGATIVE: ORANGE, FALSE_POSITIVE: BLUE}
+OUTCOME_HATCHES = {FALSE_NEGATIVE: "////", FALSE_POSITIVE: "\\\\\\\\", NO_PREDICTION: "xx"}
 
 
 @dataclass
@@ -135,10 +140,13 @@ def load_cut_view(
 def classify_outcomes(
     labels: pd.Series, probabilities: pd.Series, thresholds: pd.Series
 ) -> pd.Series:
-    """Map each tile to TP / FN / FP / TN, or not-scored for ambiguous or missing."""
+    """Map each tile to TP / FN / FP / TN, not-scored if ambiguous, or no-prediction."""
     predicted = probabilities >= thresholds
     outcome = pd.Series(NOT_SCORED, index=labels.index, dtype=object)
-    scored = probabilities.notna() & (labels != LABEL_AMBIGUOUS)
+    unambiguous = labels != LABEL_AMBIGUOUS
+    missing = probabilities.isna() | thresholds.isna()
+    outcome[missing & unambiguous] = NO_PREDICTION
+    scored = ~missing & unambiguous
     positive = labels == LABEL_POSITIVE
     outcome[scored & positive & predicted] = TRUE_POSITIVE
     outcome[scored & positive & ~predicted] = FALSE_NEGATIVE
@@ -162,41 +170,62 @@ def held_out_predictions(cv_results_path: str | Path) -> pd.DataFrame:
 
 
 MODELS = {
-    "resnet18": {"label": "ResNet-18", "prefix": "resnet18_none", "cached": False},
-    "phikon": {"label": "Phikon-v2 (frozen, cached)",
-               "prefix": "frozen_encoder_owkin-phikon-v2", "cached": True},
+    "resnet18": {"label": "ResNet-18", "prefix": "resnet18_none",
+                 "architecture": "resnet18", "encoder_name": None, "cached": False},
+    "phikon": {"label": "Phikon-v2 (frozen, cached)", "prefix": "frozen_encoder_owkin-phikon-v2",
+               "architecture": "frozen_encoder", "encoder_name": "owkin/phikon-v2", "cached": True},
 }
-# Declared defaults; others are sweep variants.
-DEFAULT_RUN_CONFIG = {
-    "epochs": 30, "patience": 5, "batch_size": 64, "weight_decay": 1e-4,
-    "positive_fraction": 0.25, "hard_negative_mining": False, "head_hidden_dim": 512,
-    "head_dropout": 0.25, "min_oocyte_area_fraction": DEFAULT_MIN_OOCYTE_AREA_FRACTION,
-    "label_rule": "area",
-}
-DEFAULT_LR = {"resnet18": 1e-4, "phikon": 1e-3}
+# Execution settings and content hashes, not hyperparameters.
+UNCOMPARED_FIELDS = ("num_workers", "output_dir", "split_manifest_sha256", "embedding_cache_sha256")
+_ABSENT = object()
+
+
+def default_run_config(model: str, tile_size: int, seed: int = 42) -> dict[str, Any]:
+    """The recorded config a run of ``model`` under TrainingConfig's defaults would carry."""
+    spec = MODELS[model]
+    config = asdict(TrainingConfig(architecture=spec["architecture"],
+                                   encoder_name=spec["encoder_name"],
+                                   tile_size=tile_size, seed=seed))
+    if spec["cached"]:
+        config["embedding_cache_dir"] = _path_relative_to_repo(cache_dir(spec["encoder_name"], tile_size))
+    return config
+
+
+def _is_default(recorded: dict[str, Any], default: dict[str, Any]) -> bool:
+    omitted = TrainingConfig.RUN_ID_OMITTED_AT_DEFAULT
+    keys = (set(recorded) | set(default)) - set(UNCOMPARED_FIELDS)
+    return all(
+        recorded.get(key, omitted.get(key)) == default.get(key, _ABSENT) for key in keys
+    )
 
 
 def find_default_cv_results(
-    model: str, tile_size: int, seed: int = 42, cv_dir: Path = REPO_ROOT / "data" / "tile_classifier_cv"
+    model: str,
+    tile_size: int,
+    seed: int = 42,
+    cv_dir: Path = REPO_ROOT / "data" / "tile_classifier_cv",
+    fold_manifest: str | Path = DEFAULT_FOLD_MANIFEST,
 ) -> Path:
-    """The one full CV run of ``model`` at ``tile_size`` under the declared defaults."""
+    """The one full CV run of ``model`` at ``tile_size`` under TrainingConfig's defaults."""
     spec = MODELS[model]
-    matches = []
+    default = default_run_config(model, tile_size, seed)
+    folds_sha256 = load_fold_manifest(fold_manifest)["_sha256"]
+    matches, other_folds = [], []
     for path in sorted(cv_dir.glob(f"{spec['prefix']}_{tile_size:04d}_*_seed{seed}_cv_*/cv_results.json")):
         cv = json.loads(path.read_text())
-        config = cv["config"]
         if cv["is_partial"] or cv["is_subset_run"]:
             continue
-        if bool(config.get("embedding_cache_dir")) != spec["cached"]:
+        if cv.get("fold_manifest_sha256") != folds_sha256:
+            other_folds.append(path.parent.name)
             continue
-        if config.get("quadrant_pooling", "mean") != "mean" or config["lr"] != DEFAULT_LR[model]:
-            continue
-        if all(config.get(key) == value for key, value in DEFAULT_RUN_CONFIG.items()):
+        if _is_default(cv["config"], default):
             matches.append(path)
     if len(matches) != 1:
         raise ValueError(
             f"expected one default {model} CV run at {tile_size} px, seed {seed}; found "
             f"{len(matches)}: {[p.parent.name for p in matches]}"
+            + (f"; skipped {other_folds} as run on other folds than {fold_manifest}"
+               if other_folds else "")
         )
     return matches[0]
 
@@ -223,12 +252,13 @@ def plot_tile_labels(view: CutView, tile_size: int) -> plt.Figure:
                 fill_alpha=0.05, edge_alpha=0.5, linewidth=0.5)
     for label in (LABEL_AMBIGUOUS, LABEL_POSITIVE):
         _draw_tiles(ax, view, tiles.loc[tiles["label"] == label], LABEL_COLOURS[label],
-                    fill_alpha=0.35)
+                    fill_alpha=0.35, hatch=LABEL_HATCHES.get(label))
     _draw_oocytes(ax, view, fill=False)
     counts = tiles["label"].value_counts()
     handles = [
         Patch(facecolor=matplotlib.colors.to_rgba(LABEL_COLOURS[label], alpha),
-              edgecolor=LABEL_COLOURS[label], label=f"{label} {counts.get(label, 0):,}")
+              edgecolor=LABEL_COLOURS[label], hatch=LABEL_HATCHES.get(label),
+              label=f"{label} {counts.get(label, 0):,}")
         for label, alpha in ((LABEL_POSITIVE, 0.5), (LABEL_AMBIGUOUS, 0.5), (LABEL_NEGATIVE, 0.08))
     ]
     handles.append(Line2D([], [], color=INK, linewidth=1.5, label="oocyte boundary"))
@@ -260,23 +290,29 @@ def plot_prediction_errors(
                 fill_alpha=0.0, edge_alpha=0.35, linewidth=0.4)
     _draw_tiles(ax, view, tiles.loc[tiles["outcome"] == NOT_SCORED], INK_MUTED,
                 fill_alpha=0.0, edge_alpha=0.8, linestyle=(0, (2, 2)))
-    for outcome, hatch in ((TRUE_POSITIVE, None), (FALSE_POSITIVE, None), (FALSE_NEGATIVE, "////")):
+    _draw_tiles(ax, view, tiles.loc[tiles["outcome"] == NO_PREDICTION], INK_MUTED,
+                fill_alpha=0.0, edge_alpha=0.9, hatch=OUTCOME_HATCHES[NO_PREDICTION])
+    for outcome in (TRUE_POSITIVE, FALSE_POSITIVE, FALSE_NEGATIVE):
         _draw_tiles(ax, view, tiles.loc[tiles["outcome"] == outcome], OUTCOME_COLOURS[outcome],
-                    hatch=hatch)
+                    hatch=OUTCOME_HATCHES.get(outcome))
     _draw_oocytes(ax, view, fill=False)
 
     counts = tiles["outcome"].value_counts()
     handles = [
         Patch(facecolor=OUTCOME_COLOURS[o], edgecolor=OUTCOME_COLOURS[o], alpha=0.6,
-              hatch="////" if o == FALSE_NEGATIVE else None, label=f"{o} {counts.get(o, 0):,}")
+              hatch=OUTCOME_HATCHES.get(o), label=f"{o} {counts.get(o, 0):,}")
         for o in (TRUE_POSITIVE, FALSE_NEGATIVE, FALSE_POSITIVE)
     ]
     handles += [
         Patch(facecolor="none", edgecolor=INK_MUTED, label=f"{TRUE_NEGATIVE} {counts.get(TRUE_NEGATIVE, 0):,}"),
         Patch(facecolor="none", edgecolor=INK_MUTED, linestyle="--",
               label=f"{NOT_SCORED} {counts.get(NOT_SCORED, 0):,}"),
-        Line2D([], [], color=INK, linewidth=1.5, label="oocyte boundary"),
     ]
+    if counts.get(NO_PREDICTION, 0):
+        handles.append(Patch(facecolor="none", edgecolor=INK_MUTED,
+                             hatch=OUTCOME_HATCHES[NO_PREDICTION],
+                             label=f"{NO_PREDICTION} {counts[NO_PREDICTION]:,}"))
+    handles.append(Line2D([], [], color=INK, linewidth=1.5, label="oocyte boundary"))
     _legend(fig, handles)
     _caption(fig, [fold_note, "threshold selected on the fold's inner validation"])
     return fig

@@ -18,6 +18,7 @@ if str(REPO_ROOT) not in sys.path:
 from src.visualization.cut_maps import (
     FALSE_NEGATIVE,
     FALSE_POSITIVE,
+    NO_PREDICTION,
     NOT_SCORED,
     TRUE_NEGATIVE,
     TRUE_POSITIVE,
@@ -35,11 +36,26 @@ STEM, CUT = "LHP_A_1_1-2", "LHP_A_1_1-2_cut000"
 
 
 def test_outcomes_follow_label_probability_and_threshold() -> None:
-    labels = pd.Series(["positive", "positive", "negative", "negative", "ambiguous", "positive"])
-    probs = pd.Series([0.9, 0.2, 0.7, 0.1, 0.9, np.nan])
-    outcomes = classify_outcomes(labels, probs, pd.Series([0.5] * 6))
+    labels = pd.Series(["positive", "positive", "negative", "negative", "ambiguous", "positive",
+                        "positive", "ambiguous"])
+    probs = pd.Series([0.9, 0.2, 0.7, 0.1, 0.9, np.nan, 0.9, np.nan])
+    thresholds = pd.Series([0.5] * 6 + [np.nan, 0.5])
+    outcomes = classify_outcomes(labels, probs, thresholds)
     assert list(outcomes) == [TRUE_POSITIVE, FALSE_NEGATIVE, FALSE_POSITIVE, TRUE_NEGATIVE,
-                              NOT_SCORED, NOT_SCORED]
+                              NOT_SCORED, NO_PREDICTION, NO_PREDICTION, NOT_SCORED]
+
+
+def _legend_styles(handles: list) -> list[tuple]:
+    from matplotlib.colors import to_rgba
+
+    styles = []
+    for handle in handles:
+        if hasattr(handle, "get_hatch"):
+            styles.append(("patch", handle.get_hatch() or "", str(handle.get_linestyle()),
+                           round(to_rgba(handle.get_facecolor())[3], 1)))
+        else:
+            styles.append(("line", str(handle.get_linestyle())))
+    return styles
 
 
 @pytest.fixture
@@ -90,28 +106,133 @@ def test_every_figure_renders(cut_dirs, tmp_path: Path) -> None:
         assert Image.open(path).size[0] > 64
 
 
-def _write_cv(root: Path, name: str, config: dict, partial: bool = False) -> None:
-    base = {"epochs": 30, "patience": 5, "batch_size": 64, "weight_decay": 1e-4,
-            "positive_fraction": 0.25, "hard_negative_mining": False, "head_hidden_dim": 512,
-            "head_dropout": 0.25, "min_oocyte_area_fraction": 0.05, "label_rule": "area",
-            "lr": 1e-3, "quadrant_pooling": "mean", "embedding_cache_dir": "cache"}
+PHIKON_PREFIX = "frozen_encoder_owkin-phikon-v2_0512_area0500_seed42_cv_"
+
+
+def _folds(root: Path) -> Path:
+    path = root / "fold_manifest.json"
+    if not path.exists():
+        path.write_text('{"folds": []}')
+    return path
+
+
+def _write_cv(root: Path, name: str, overrides: dict | None = None, recorded: dict | None = None,
+              partial: bool = False, model: str = "phikon", fold_manifest: Path | None = None,
+              fold_sha256: str | None = None) -> None:
+    import hashlib
+    from dataclasses import asdict
+
+    from src.modeling.train_tile_classifier import TrainingConfig
+
+    arm = ({"architecture": "frozen_encoder", "encoder_name": "owkin/phikon-v2", "num_workers": 3}
+           if model == "phikon" else {"architecture": "resnet18", "num_workers": 7})
+    config = asdict(TrainingConfig(tile_size=512, **{**arm, **(overrides or {})}))
+    if model == "phikon":
+        config["embedding_cache_dir"] = "data/embedding_cache/owkin-phikon-v2/0512"
+    config.update(recorded or {})
+    folds = fold_manifest or _folds(root)
+    fold_sha256 = fold_sha256 or hashlib.sha256(folds.read_bytes()).hexdigest()
     path = root / name / "cv_results.json"
     path.parent.mkdir(parents=True)
-    path.write_text(json.dumps({"config": {**base, **config}, "is_partial": partial,
-                                "is_subset_run": False}))
+    path.write_text(json.dumps({
+        "config": config, "is_partial": partial, "fold_manifest_path": str(folds),
+        "fold_manifest_sha256": fold_sha256,
+        "is_subset_run": any(config.get(key) is not None for key in
+                             ("max_train_slides", "max_batches_per_epoch", "max_val_tiles")),
+    }))
+
+
+def _lookup(root: Path, model: str = "phikon") -> str:
+    return find_default_cv_results(model, 512, cv_dir=root, fold_manifest=_folds(root)).parent.name
 
 
 def test_default_run_lookup_skips_sweep_variants(tmp_path: Path) -> None:
-    prefix = "frozen_encoder_owkin-phikon-v2_0512_area0500_seed42_cv_"
-    _write_cv(tmp_path, prefix + "aaaa", {})
-    _write_cv(tmp_path, prefix + "bbbb", {"hard_negative_mining": True})
-    _write_cv(tmp_path, prefix + "cccc", {"embedding_cache_dir": None})
-    _write_cv(tmp_path, prefix + "dddd", {}, partial=True)
-    assert find_default_cv_results("phikon", 512, cv_dir=tmp_path).parent.name == prefix + "aaaa"
+    other_folds = tmp_path / "other_folds.json"
+    other_folds.write_text('{"folds": [], "version": "other"}')
+    _write_cv(tmp_path, PHIKON_PREFIX + "aaaa")
+    _write_cv(tmp_path, PHIKON_PREFIX + "bbbb", {"hard_negative_mining": True})
+    _write_cv(tmp_path, PHIKON_PREFIX + "cccc", recorded={"embedding_cache_dir": None})
+    _write_cv(tmp_path, PHIKON_PREFIX + "dddd", partial=True)
+    _write_cv(tmp_path, PHIKON_PREFIX + "ffff", {"head_hidden_dim": 256})
+    _write_cv(tmp_path, PHIKON_PREFIX + "gggg", recorded={"quadrant_pooling": "max"})
+    _write_cv(tmp_path, PHIKON_PREFIX + "hhhh", fold_manifest=other_folds)
+    _write_cv(tmp_path, PHIKON_PREFIX + "jjjj", recorded={
+        "embedding_cache_dir": "data/embedding_cache_variant/owkin-phikon-v2/0512"})
+    _write_cv(tmp_path, PHIKON_PREFIX + "llll", recorded={"a_retired_field": 1})
+    _write_cv(tmp_path, PHIKON_PREFIX + "mmmm", fold_sha256="0" * 64)
+    assert _lookup(tmp_path) == PHIKON_PREFIX + "aaaa"
 
-    _write_cv(tmp_path, prefix + "eeee", {})
+    (tmp_path / "fold_manifest.json").write_text('{"folds": [], "version": "regenerated"}')
+    with pytest.raises(ValueError, match="found 0.*skipped .* as run on other folds"):
+        _lookup(tmp_path)
+    (tmp_path / "fold_manifest.json").write_text('{"folds": []}')
+
+    _write_cv(tmp_path, PHIKON_PREFIX + "eeee", {"num_workers": 7})
     with pytest.raises(ValueError, match="found 2"):
-        find_default_cv_results("phikon", 512, cv_dir=tmp_path)
+        _lookup(tmp_path)
+
+
+def test_stale_content_hashes_do_not_exclude_the_default_run(tmp_path: Path) -> None:
+    _write_cv(tmp_path, PHIKON_PREFIX + "aaaa",
+              recorded={"embedding_cache_sha256": "0" * 64, "split_manifest_sha256": "1" * 64})
+    assert _lookup(tmp_path) == PHIKON_PREFIX + "aaaa"
+
+
+def test_the_resnet_default_run_has_no_cache(tmp_path: Path) -> None:
+    prefix = "resnet18_none_0512_area0500_seed42_cv_"
+    _write_cv(tmp_path, prefix + "aaaa", model="resnet18")
+    _write_cv(tmp_path, prefix + "bbbb", {"lr": 1e-3}, model="resnet18")
+    _write_cv(tmp_path, prefix + "cccc", model="resnet18",
+              recorded={"embedding_cache_dir": "data/embedding_cache/owkin-phikon-v2/0512"})
+    assert _lookup(tmp_path, "resnet18") == prefix + "aaaa"
+
+
+def test_default_run_follows_the_training_defaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.modeling.train_tile_classifier as train_module
+
+    _write_cv(tmp_path, PHIKON_PREFIX + "aaaa", {"lr": 1e-3})
+    _write_cv(tmp_path, PHIKON_PREFIX + "bbbb", {"lr": 5e-4})
+    monkeypatch.setitem(train_module.DEFAULT_LR, "frozen_encoder", 5e-4)
+    assert _lookup(tmp_path) == PHIKON_PREFIX + "bbbb"
+
+
+def test_no_figure_tells_identities_apart_by_colour_alone(
+    cut_dirs, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.visualization.cut_maps as cut_maps
+
+    shown = []
+    real_legend = cut_maps._legend
+    monkeypatch.setattr(cut_maps, "_legend",
+                        lambda fig, handles: shown.append(handles) or real_legend(fig, handles))
+    cuts, tiles = cut_dirs
+    view = load_cut_view(STEM, CUT, tile_sizes=(256,), cuts_dir=cuts, tiles_dir=tiles)
+    predictions = pd.DataFrame(
+        {"prob": [0.9, 0.9], "fold": [1, 1], "threshold": [0.5] * 2, "fold_auprc": [0.9] * 2},
+        index=pd.Index(["t_in", "t_out"], name="tile_id"),
+    )
+    view.tiles = pd.concat([view.tiles, view.tiles.iloc[[0]].assign(tile_id="t_missing")])
+    plot_tile_labels(view, 256)
+    plot_prediction_errors(view, 256, predictions, "M")
+    assert len(shown) == 2
+    for handles in shown:
+        styles = _legend_styles(handles)
+        assert len(set(styles)) == len(styles), styles
+
+
+def test_a_missing_prediction_is_counted_apart_from_ambiguous_tiles(cut_dirs) -> None:
+    cuts, tiles = cut_dirs
+    view = load_cut_view(STEM, CUT, tile_sizes=(256,), cuts_dir=cuts, tiles_dir=tiles)
+    predictions = pd.DataFrame(
+        {"prob": [0.9], "fold": [1], "threshold": [0.5], "fold_auprc": [0.9]},
+        index=pd.Index(["t_in"], name="tile_id"),
+    )
+    fig = plot_prediction_errors(view, 256, predictions, "M")
+    labels = [text.get_text() for text in fig.legends[0].get_texts()]
+    assert f"{NOT_SCORED} 1" in labels
+    assert f"{NO_PREDICTION} 1" in labels
 
 
 def test_overlapping_annotations_are_not_double_counted(cut_dirs) -> None:
