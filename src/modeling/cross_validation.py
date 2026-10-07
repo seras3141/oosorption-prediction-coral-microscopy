@@ -176,11 +176,13 @@ def run_fold(
 def cv_run_id(base: "TrainingConfig", fold_manifest_sha256: str, length: int = 8) -> str:
     """Name a CV run by its config and fold manifest."""
     prefix = re.sub(r"_[0-9a-f]+$", "", base.run_id())
+    omitted = base.RUN_ID_OMITTED_AT_DEFAULT
     payload = {
         key: value
         for key, value in sorted(asdict(base).items())
         if key not in base.RUN_ID_EXCLUDED
         and key not in ("split_manifest_path", "split_manifest_sha256")
+        and not (key in omitted and value == omitted[key])
     }
     payload["fold_manifest_sha256"] = fold_manifest_sha256
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
@@ -238,7 +240,6 @@ def aggregate(
     fold_results: dict[int, dict[str, Any]],
     *,
     allow_partial: bool = False,
-    augmentation: str = "standard",
 ) -> dict[str, Any]:
     """Combine per-fold evaluations into the cross-validation result."""
     k = fold_manifest["n_folds"]
@@ -288,7 +289,7 @@ def aggregate(
         "fold_manifest_sha256": fold_manifest["_sha256"],
         "config": {key: value for key, value in asdict(base).items()
                    if key not in ("split_manifest_path", "split_manifest_sha256")},
-        "augmentation": augmentation,
+        "augmentation": "none (cached embeddings)" if base.embedding_cache_dir else "standard",
         "is_partial": bool(missing),
         "is_subset_run": any(bool(f["is_subset_run"]) for f in per_fold),
         "folds_missing": missing,

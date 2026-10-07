@@ -104,6 +104,14 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         help="Slide-to-split manifest to train and validate against. Default: the v1 "
              "slide-level split, %(default)s. Cross-validation passes one per fold.",
     )
+    parser.add_argument(
+        "--embedding-cache-dir", default=None,
+        help="Frozen-encoder arm only: train the head on this embedding cache.",
+    )
+    parser.add_argument(
+        "--quadrant-pooling", choices=("mean", "max"), default="mean",
+        help="Cached 1024 px embeddings only: how the four quadrants are pooled.",
+    )
     parser.add_argument("--label-rule", choices=LABEL_RULES, default="area")
     parser.add_argument(
         "--min-oocyte-area-fraction", type=_unit_interval,
@@ -206,6 +214,8 @@ def config_from_args(args: argparse.Namespace) -> TrainingConfig:
         max_batches_per_epoch=args.max_batches_per_epoch,
         max_val_tiles=args.max_val_tiles,
         split_manifest_path=args.split_manifest,
+        embedding_cache_dir=args.embedding_cache_dir,
+        quadrant_pooling=args.quadrant_pooling,
         output_dir=args.output_dir,
     )
 

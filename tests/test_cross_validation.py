@@ -429,3 +429,17 @@ def test_an_unsupported_tile_size_fails_before_the_index_is_parsed(
     base = TrainingConfig(architecture="frozen_encoder", tile_size=128)
     with pytest.raises(ValueError, match="supports tile sizes"):
         run_fold(base, _fold_manifest(), 1)
+
+
+@pytest.mark.parametrize(
+    ("tile_size", "expected"),
+    [
+        (256, "resnet18_none_0256_area0500_seed42_cv_b4bf0377"),
+        (512, "resnet18_none_0512_area0500_seed42_cv_9970f198"),
+        (1024, "resnet18_none_1024_area0500_seed42_cv_72a05501"),
+    ],
+)
+def test_recorded_cv_run_ids_survive_new_config_fields(tile_size: int, expected: str) -> None:
+    manifest = load_fold_manifest()
+    base = TrainingConfig(tile_size=tile_size, num_workers=7)
+    assert cv_run_id(base, manifest["_sha256"]) == expected

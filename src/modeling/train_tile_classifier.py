@@ -28,7 +28,7 @@ import time
 import hashlib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 import pandas as pd
@@ -42,6 +42,8 @@ from src.modeling.encoders import (
     DEFAULT_HEAD_HIDDEN_DIM,
     IMAGENET_MEAN,
     IMAGENET_STD,
+    SUB_TILE_PX,
+    EmbeddingHead,
     encoder_input_px,
     encoder_spec,
     load_encoder,
@@ -57,6 +59,9 @@ from src.modeling.tile_index import (
     training_rows,
 )
 from src.modeling.tile_labels import DEFAULT_MIN_OOCYTE_AREA_FRACTION, LABEL_POSITIVE
+
+if TYPE_CHECKING:
+    from src.modeling.embedding_cache import EmbeddingCache
 
 LOG = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -117,6 +122,9 @@ class TrainingConfig:
     max_val_tiles: int | None = None
     split_manifest_path: str = DEFAULT_SPLIT_MANIFEST
     split_manifest_sha256: str | None = None
+    embedding_cache_dir: str | None = None
+    embedding_cache_sha256: str | None = None
+    quadrant_pooling: str = "mean"
     output_dir: str = "data/tile_classifier"
 
     #: Fields that do not change a run's numbers and so stay out of its fingerprint.
@@ -132,6 +140,9 @@ class TrainingConfig:
     RUN_ID_OMITTED_AT_DEFAULT: ClassVar[dict[str, Any]] = {
         "split_manifest_path": DEFAULT_SPLIT_MANIFEST,
         "split_manifest_sha256": None,
+        "embedding_cache_dir": None,
+        "embedding_cache_sha256": None,
+        "quadrant_pooling": "mean",
     }
 
     def __post_init__(self) -> None:
@@ -180,6 +191,37 @@ class TrainingConfig:
             Path(os.path.normpath(self.split_manifest_path))
         )
         self._bind_split_manifest()
+        self._resolve_embedding_cache()
+
+    def _resolve_embedding_cache(self) -> None:
+        """Validate the cached-embedding options and bind the cache's contents."""
+        if self.quadrant_pooling not in ("mean", "max"):
+            raise ValueError(f"quadrant_pooling must be mean or max, got {self.quadrant_pooling!r}")
+        if self.embedding_cache_dir is None:
+            if self.quadrant_pooling != "mean":
+                raise ValueError("quadrant_pooling is only configurable on cached embeddings")
+            self.embedding_cache_sha256 = None
+            return
+        if self.architecture != ARCHITECTURE_FROZEN_ENCODER:
+            raise ValueError("embedding_cache_dir needs the frozen_encoder architecture")
+        if self.tile_size != 2 * SUB_TILE_PX:
+            # One sub-tile, so mean equals max.
+            self.quadrant_pooling = "mean"
+        self.embedding_cache_dir = _path_relative_to_repo(
+            Path(os.path.normpath(self.embedding_cache_dir))
+        )
+        meta = _resolve_repo_path(self.embedding_cache_dir) / "meta.json"
+        if not meta.exists():
+            if self.embedding_cache_sha256 is not None:
+                raise ValueError(f"{self.embedding_cache_dir} no longer holds a cache")
+            return
+        current = hashlib.sha256(meta.read_bytes()).hexdigest()
+        if self.embedding_cache_sha256 is not None and self.embedding_cache_sha256 != current:
+            raise ValueError(
+                f"the embedding cache at {self.embedding_cache_dir} was rebuilt since this "
+                "run was trained; its checkpoint describes different embeddings"
+            )
+        self.embedding_cache_sha256 = current
 
     def _bind_split_manifest(self) -> None:
         """Bind the config to the manifest's contents, refusing a changed file."""
@@ -350,7 +392,9 @@ def build_transforms(
     return transforms.Compose(steps)
 
 
-def build_model(config: TrainingConfig, pretrained: bool = True) -> nn.Module:
+def build_model(
+    config: TrainingConfig, pretrained: bool = True, cache: EmbeddingCache | None = None
+) -> nn.Module:
     """Build the classifier for the configured architecture.
 
     Returns a model whose forward gives one logit per tile.
@@ -371,6 +415,9 @@ def build_model(config: TrainingConfig, pretrained: bool = True) -> nn.Module:
         model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1 if pretrained else None)
         model.fc = nn.Linear(model.fc.in_features, 1)
         return model
+    if config.architecture == ARCHITECTURE_FROZEN_ENCODER and config.embedding_cache_dir:
+        cache = cache if cache is not None else load_config_cache(config)
+        return EmbeddingHead(cache.embedding_dim, config.head_hidden_dim, config.head_dropout)
     if config.architecture == ARCHITECTURE_FROZEN_ENCODER:
         return load_encoder(
             encoder_name=config.encoder_name or DEFAULT_ENCODER,
@@ -379,6 +426,24 @@ def build_model(config: TrainingConfig, pretrained: bool = True) -> nn.Module:
             dropout=config.head_dropout,
         )
     raise ValueError(f"architecture must be one of {ARCHITECTURES}")
+
+
+def load_config_cache(config: TrainingConfig) -> EmbeddingCache:
+    """Open the run's embedding cache, checked against its tile size and encoder."""
+    from src.modeling.embedding_cache import load_cache
+
+    cache = load_cache(config.embedding_cache_dir, config.tile_size, config.encoder_name)
+    if config.embedding_cache_sha256 is None:
+        raise ValueError(
+            f"this run's config was created before its embedding cache existed at "
+            f"{config.embedding_cache_dir}; create the config again"
+        )
+    if cache.meta_sha256 != config.embedding_cache_sha256:
+        raise ValueError(
+            f"the embedding cache at {config.embedding_cache_dir} was rebuilt since this "
+            "run was configured; its run id describes different embeddings"
+        )
+    return cache
 
 
 def prepare_splits(config: TrainingConfig) -> dict[str, pd.DataFrame]:
@@ -485,7 +550,8 @@ def train(config: TrainingConfig) -> TrainingResult:
     # multi-GB weight load rather than a cheap construction, but a bad architecture,
     # encoder or tile size should still surface before the index is parsed -- and
     # load_encoder validates all three before fetching anything.
-    model = build_model(config)
+    cache = load_config_cache(config) if config.embedding_cache_dir else None
+    model = build_model(config, cache=cache)
 
     run_dir = _resolve_repo_path(config.output_dir) / config.run_id()
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -530,25 +596,10 @@ def train(config: TrainingConfig) -> TrainingResult:
     superseded_purged = False
 
     splits = prepare_splits(config)
-    input_px = input_px_for(config)
-    mean, std = normalisation_for(config)
-    LOG.info("Input %d px, normalisation mean=%s std=%s", input_px, mean, std)
-    train_dataset = TileClassificationDataset(
-        splits["train"],
-        transform=build_transforms(train=True, input_px=input_px, mean=mean, std=std),
-    )
-    # Same tiles, deterministic transform. Ranking negatives for mining must not depend
-    # on which random flip, rotation and jitter each one happened to draw: that puts
-    # noise straight into which tiles enter the hard pool, and makes the ranking
-    # irreproducible from the checkpoint.
-    scoring_dataset = TileClassificationDataset(
-        splits["train"],
-        transform=build_transforms(train=False, input_px=input_px, mean=mean, std=std),
-    )
-    val_dataset = TileClassificationDataset(
-        splits["val"],
-        transform=build_transforms(train=False, input_px=input_px, mean=mean, std=std),
-    )
+    if cache is not None:
+        train_dataset, scoring_dataset, val_dataset = _cached_datasets(config, splits, cache)
+    else:
+        train_dataset, scoring_dataset, val_dataset = _image_datasets(config, splits)
 
     sampler = ForcedRatioBatchSampler(
         train_dataset.positive_positions(),
@@ -697,6 +748,46 @@ def train(config: TrainingConfig) -> TrainingResult:
     )
     _write_run_log(run_log_path, result)
     return result
+
+
+def _image_datasets(
+    config: TrainingConfig, splits: dict[str, pd.DataFrame]
+) -> tuple[TileClassificationDataset, TileClassificationDataset, TileClassificationDataset]:
+    """Train (augmented), scoring and validation datasets over tile images."""
+    input_px = input_px_for(config)
+    mean, std = normalisation_for(config)
+    LOG.info("Input %d px, normalisation mean=%s std=%s", input_px, mean, std)
+    return (
+        TileClassificationDataset(
+            splits["train"],
+            transform=build_transforms(train=True, input_px=input_px, mean=mean, std=std),
+        ),
+        # Deterministic, so mining ranks reproducibly.
+        TileClassificationDataset(
+            splits["train"],
+            transform=build_transforms(train=False, input_px=input_px, mean=mean, std=std),
+        ),
+        TileClassificationDataset(
+            splits["val"],
+            transform=build_transforms(train=False, input_px=input_px, mean=mean, std=std),
+        ),
+    )
+
+
+def _cached_datasets(
+    config: TrainingConfig, splits: dict[str, pd.DataFrame], cache: EmbeddingCache
+) -> tuple[TileClassificationDataset, TileClassificationDataset, TileClassificationDataset]:
+    """Train, scoring and validation datasets over cached embeddings."""
+    from src.modeling.embedding_cache import CachedEmbeddingDataset
+
+    LOG.info("Cached embeddings from %s, %s pooling", cache.path, config.quadrant_pooling)
+    train_dataset = CachedEmbeddingDataset(splits["train"], cache, config.quadrant_pooling)
+    # No augmentation: mining scores the train set.
+    return (
+        train_dataset,
+        train_dataset,
+        CachedEmbeddingDataset(splits["val"], cache, config.quadrant_pooling),
+    )
 
 
 def _check_mining_configuration(config: TrainingConfig) -> None:

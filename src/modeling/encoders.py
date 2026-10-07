@@ -226,12 +226,7 @@ class FrozenEncoderClassifier(nn.Module):
         for parameter in self.encoder.parameters():
             parameter.requires_grad_(False)
 
-        self.head = nn.Sequential(
-            nn.Linear(embedding_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
-        )
+        self.head = build_head(embedding_dim, hidden_dim, dropout)
 
     @property
     def pools_sub_tiles(self) -> bool:
@@ -263,16 +258,44 @@ class FrozenEncoderClassifier(nn.Module):
         return self.head(embeddings).squeeze(-1)
 
     def _embed(self, images: torch.Tensor) -> torch.Tensor:
+        return self.sub_tile_embeddings(images).mean(dim=1)
+
+    def sub_tile_embeddings(self, images: torch.Tensor) -> torch.Tensor:
+        """Return ``(batch, n_sub_tiles, embedding_dim)``: 4 at 1024 px, else 1."""
         if not self.pools_sub_tiles:
-            return _pooled_embedding(self.encoder, images)
+            return _pooled_embedding(self.encoder, images).unsqueeze(1)
         quadrants = _split_into_quadrants(images)
-        # One backbone pass over batch*4 sub-tiles, then mean-pool per tile. Passing the
-        # quadrants as one batch rather than looping keeps the GPU busy and makes the
-        # pooling exact rather than a running average.
         batch, _, _, _ = images.shape
         flat = quadrants.reshape(batch * 4, *quadrants.shape[2:])
-        embedded = _pooled_embedding(self.encoder, flat)
-        return embedded.reshape(batch, 4, -1).mean(dim=1)
+        return _pooled_embedding(self.encoder, flat).reshape(batch, 4, -1)
+
+
+class EmbeddingHead(nn.Module):
+    """The frozen arm's head alone, trained on cached embeddings."""
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        hidden_dim: int = DEFAULT_HEAD_HIDDEN_DIM,
+        dropout: float = DEFAULT_HEAD_DROPOUT,
+    ) -> None:
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        # Matches FrozenEncoderClassifier.head for checkpoint reuse.
+        self.head = build_head(embedding_dim, hidden_dim, dropout)
+
+    def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
+        return self.head(embeddings).squeeze(-1)
+
+
+def build_head(embedding_dim: int, hidden_dim: int, dropout: float) -> nn.Sequential:
+    """Build the two-layer MLP head shared by the live and cached frozen arms."""
+    return nn.Sequential(
+        nn.Linear(embedding_dim, hidden_dim),
+        nn.ReLU(inplace=True),
+        nn.Dropout(dropout),
+        nn.Linear(hidden_dim, 1),
+    )
 
 
 def _split_into_quadrants(images: torch.Tensor) -> torch.Tensor:
