@@ -14,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.visualization.cut_maps import (
     MODELS,
+    NoDefaultRunError,
     find_default_cv_results,
     held_out_predictions,
     list_cuts,
@@ -55,13 +56,25 @@ def main(argv: list[str] | None = None) -> int:
         if missing:
             raise SystemExit(f"unknown cut(s): {sorted(missing)}")
 
-    predictions = {}
+    runs, missing = {}, []
     if "errors" in args.figures:
         for model in args.models:
             for size in args.tile_sizes:
-                path = find_default_cv_results(model, size, args.seed)
-                logging.info("%s %d px: %s", model, size, path.parent.name)
-                predictions[(model, size)] = held_out_predictions(path)
+                try:
+                    runs[(model, size)] = find_default_cv_results(model, size, args.seed)
+                except NoDefaultRunError:
+                    missing.append(f"{model} at {size} px")
+    if missing:
+        raise SystemExit(
+            f"no default seed-{args.seed} CV run for {', '.join(missing)}. For error maps, "
+            "drop those sizes from --tile-sizes or those models from --models; to draw those "
+            "sizes without error maps, pass --figures overlay labels"
+        )
+
+    predictions = {}
+    for (model, size), path in runs.items():
+        logging.info("%s %d px: %s", model, size, path.parent.name)
+        predictions[(model, size)] = held_out_predictions(path)
 
     for stem, cut_name in cuts:
         view = load_cut_view(stem, cut_name, tile_sizes=tuple(args.tile_sizes))

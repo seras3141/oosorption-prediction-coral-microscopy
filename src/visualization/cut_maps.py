@@ -210,6 +210,10 @@ def _is_default(recorded: dict[str, Any], default: dict[str, Any]) -> bool:
     )
 
 
+class NoDefaultRunError(ValueError):
+    """No default CV run exists for a model at a tile size: none complete, partial or stale."""
+
+
 def find_default_cv_results(
     model: str,
     tile_size: int,
@@ -223,23 +227,28 @@ def find_default_cv_results(
     spec = MODELS[model]
     default = default_run_config(model, tile_size, seed)
     folds_sha256 = load_fold_manifest(fold_manifest)["_sha256"]
-    matches, other_folds = [], []
+    matches, other_folds, partial = [], [], []
     for path in sorted(cv_dir.glob(f"{spec['prefix']}_{tile_size:04d}_*_seed{seed}_cv_*/cv_results.json")):
         cv = json.loads(path.read_text())
-        if cv["is_partial"] or cv["is_subset_run"]:
+        if cv["is_subset_run"] or not _is_default(cv["config"], default):
             continue
         if cv.get("fold_manifest_sha256") != folds_sha256:
             other_folds.append(path.parent.name)
-            continue
-        if _is_default(cv["config"], default):
+        elif cv["is_partial"]:
+            partial.append(path.parent.name)
+        else:
             matches.append(path)
+    message = (
+        f"expected one default {model} CV run at {tile_size} px, seed {seed}; found "
+        f"{len(matches)}: {[p.parent.name for p in matches]}"
+        + (f"; skipped {other_folds} as run on other folds than {fold_manifest}"
+           if other_folds else "")
+        + (f"; skipped {partial} as partial" if partial else "")
+    )
+    if not matches and not other_folds and not partial:
+        raise NoDefaultRunError(message)
     if len(matches) != 1:
-        raise ValueError(
-            f"expected one default {model} CV run at {tile_size} px, seed {seed}; found "
-            f"{len(matches)}: {[p.parent.name for p in matches]}"
-            + (f"; skipped {other_folds} as run on other folds than {fold_manifest}"
-               if other_folds else "")
-        )
+        raise ValueError(message)
     return matches[0]
 
 

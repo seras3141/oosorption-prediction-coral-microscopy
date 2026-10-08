@@ -332,3 +332,68 @@ def test_a_fold_without_a_threshold_is_named_beside_the_selected_ones(cut_dirs) 
     caption = next(text.get_text() for text in fig.texts if "fold AUPRC" in text.get_text())
     assert "threshold selected on the fold's inner validation" in caption
     assert "fold 2: no threshold recorded, unambiguous tiles drawn as no prediction" in caption
+
+
+def test_the_cli_refusal_names_the_figures_a_size_without_runs_can_draw(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.plot_cut_maps as cli
+    from src.visualization.cut_maps import NoDefaultRunError
+
+    def no_run(model: str, tile_size: int, seed: int = 42, **kwargs) -> Path:
+        raise NoDefaultRunError(f"no default {model} CV run")
+
+    monkeypatch.setattr(cli, "find_default_cv_results", no_run)
+    monkeypatch.setattr(cli, "list_cuts", lambda *args, **kwargs: [])
+    with pytest.raises(SystemExit) as raised:
+        cli.main(["--tile-sizes", "128", "256"])
+    message = str(raised.value)
+    assert "no default seed-42 CV run" in message
+    for model in ("resnet18", "phikon"):
+        for size in (128, 256):
+            assert f"{model} at {size} px" in message
+    assert "--tile-sizes" in message and "--models" in message
+    assert "--figures overlay labels" in message
+
+
+def test_the_cli_passes_other_lookup_errors_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.plot_cut_maps as cli
+
+    def stale_manifest(model: str, tile_size: int, seed: int = 42, **kwargs) -> Path:
+        raise ValueError("fold 2: split file does not match the hash")
+
+    monkeypatch.setattr(cli, "find_default_cv_results", stale_manifest)
+    monkeypatch.setattr(cli, "list_cuts", lambda *args, **kwargs: [])
+    with pytest.raises(ValueError, match="fold 2"):
+        cli.main(["--tile-sizes", "512"])
+
+    _write_cv(tmp_path, PHIKON_PREFIX + "aaaa")
+    _write_cv(tmp_path, PHIKON_PREFIX + "bbbb", {"num_workers": 7})
+    with pytest.raises(ValueError, match="found 2") as raised:
+        _lookup(tmp_path)
+    assert type(raised.value) is ValueError
+
+
+def test_runs_only_on_other_folds_are_not_reported_as_missing(tmp_path: Path) -> None:
+    _write_cv(tmp_path, PHIKON_PREFIX + "aaaa", fold_sha256="0" * 64)
+    with pytest.raises(ValueError, match="skipped .* as run on other folds") as raised:
+        _lookup(tmp_path)
+    assert type(raised.value) is ValueError
+
+
+def test_a_partial_default_run_is_named_rather_than_reported_missing(tmp_path: Path) -> None:
+    _write_cv(tmp_path, PHIKON_PREFIX + "aaaa", partial=True)
+    with pytest.raises(ValueError, match=r"skipped \['" + PHIKON_PREFIX + r"aaaa'\] as partial") as raised:
+        _lookup(tmp_path)
+    assert type(raised.value) is ValueError
+
+
+def test_a_stale_sweep_run_does_not_hide_a_missing_default(tmp_path: Path) -> None:
+    from src.visualization.cut_maps import NoDefaultRunError
+
+    _write_cv(tmp_path, PHIKON_PREFIX + "aaaa", {"lr": 5e-4}, fold_sha256="0" * 64)
+    _write_cv(tmp_path, PHIKON_PREFIX + "bbbb", {"lr": 5e-4}, partial=True)
+    with pytest.raises(NoDefaultRunError):
+        _lookup(tmp_path)
