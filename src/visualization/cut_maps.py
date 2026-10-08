@@ -180,7 +180,6 @@ MODELS = {
     "phikon": {"label": "Phikon-v2 (frozen, cached)", "prefix": "frozen_encoder_owkin-phikon-v2",
                "architecture": "frozen_encoder", "encoder_name": "owkin/phikon-v2", "cached": True},
 }
-# Execution settings and content hashes, not hyperparameters.
 UNCOMPARED_FIELDS = ("num_workers", "output_dir", "split_manifest_sha256", "embedding_cache_sha256")
 _ABSENT = object()
 
@@ -218,7 +217,9 @@ def find_default_cv_results(
     cv_dir: Path = REPO_ROOT / "data" / "tile_classifier_cv",
     fold_manifest: str | Path = DEFAULT_FOLD_MANIFEST,
 ) -> Path:
-    """The one full CV run of ``model`` at ``tile_size`` under TrainingConfig's defaults."""
+    """The one full CV run of ``model`` at ``tile_size`` under TrainingConfig's defaults,
+    ignoring output path, content hashes and worker count; the last changes augmentation,
+    but the reference runs used 3 (Phikon-v2) and 7 (ResNet-18) workers."""
     spec = MODELS[model]
     default = default_run_config(model, tile_size, seed)
     folds_sha256 = load_fold_manifest(fold_manifest)["_sha256"]
@@ -277,11 +278,20 @@ def plot_tile_labels(view: CutView, tile_size: int) -> plt.Figure:
     _legend(fig, handles)
     _caption(fig, [
         f"{len(tiles):,} tiles kept by the tissue filter",
-        f"positive: oocyte coverage ≥ {view.min_oocyte_area_fraction:g} · "
-        f"ambiguous: 0 < coverage < {view.min_oocyte_area_fraction:g}",
+        _label_rule(view.min_oocyte_area_fraction),
         "tiles overlap by 20%",
     ])
     return fig
+
+
+def _label_rule(threshold: float) -> str:
+    if threshold == 0:
+        return "positive: oocyte coverage > 0"
+    return f"positive: oocyte coverage ≥ {threshold:g} · ambiguous: 0 < coverage < {threshold:g}"
+
+
+def _metric(value: float) -> str:
+    return "undefined" if pd.isna(value) else f"{value:.3f}"
 
 
 def plot_prediction_errors(
@@ -292,11 +302,19 @@ def plot_prediction_errors(
     joined = tiles.join(predictions, on="tile_id")
     tiles["outcome"] = classify_outcomes(joined["label"], joined["prob"], joined["threshold"])
     folds = sorted(joined["fold"].dropna().astype(int).unique())
+    fold_rows = {f: joined.loc[joined["fold"] == f].iloc[0] for f in folds}
     fold_note = ", ".join(
-        f"fold {f}: threshold {joined.loc[joined['fold'] == f, 'threshold'].iloc[0]:.3f}, "
-        f"fold AUPRC {joined.loc[joined['fold'] == f, 'fold_auprc'].iloc[0]:.3f}"
-        for f in folds
+        f"fold {f}: threshold {_metric(row['threshold'])}, fold AUPRC {_metric(row['fold_auprc'])}"
+        for f, row in fold_rows.items()
     ) or "no held-out predictions for this cut"
+    unselected = [f for f, row in fold_rows.items() if pd.isna(row["threshold"])]
+    notes = [fold_note]
+    if len(unselected) < len(folds):
+        notes.append("threshold selected on the fold's inner validation")
+    if unselected:
+        label = "fold" if len(unselected) == 1 else "folds"
+        notes.append(f"{label} {', '.join(map(str, unselected))}: no threshold recorded, "
+                     f"unambiguous tiles drawn as {NO_PREDICTION}")
 
     fig, ax = _canvas(view, subtitle=f"{model_name} · held-out predictions at {tile_size} px")
     _draw_tiles(ax, view, tiles.loc[tiles["outcome"] == TRUE_NEGATIVE], INK_MUTED,
@@ -327,7 +345,7 @@ def plot_prediction_errors(
                              label=f"{NO_PREDICTION} {counts[NO_PREDICTION]:,}"))
     handles.append(Line2D([], [], color=INK, linewidth=1.5, label="oocyte boundary"))
     _legend(fig, handles)
-    _caption(fig, [fold_note, "threshold selected on the fold's inner validation"])
+    _caption(fig, notes)
     return fig
 
 

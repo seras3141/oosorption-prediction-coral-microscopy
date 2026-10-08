@@ -279,12 +279,18 @@ def test_label_and_overlay_maps_do_not_need_torch() -> None:
     assert run.returncode == 0, run.stderr or "importing cut_maps loaded torch"
 
 
-def test_the_label_caption_states_the_threshold_drawn(cut_dirs) -> None:
+@pytest.mark.parametrize(("threshold", "rule"), [
+    (0.1, "positive: oocyte coverage ≥ 0.1 · ambiguous: 0 < coverage < 0.1"),
+    (0.0, "positive: oocyte coverage > 0"),
+])
+def test_the_label_caption_states_the_rule_drawn(cut_dirs, threshold: float, rule: str) -> None:
     cuts, tiles = cut_dirs
-    view = load_cut_view(STEM, CUT, tile_sizes=(256,), min_oocyte_area_fraction=0.1,
+    view = load_cut_view(STEM, CUT, tile_sizes=(256,), min_oocyte_area_fraction=threshold,
                          cuts_dir=cuts, tiles_dir=tiles)
-    captions = [text.get_text() for text in plot_tile_labels(view, 256).texts]
-    assert any("coverage ≥ 0.1 · ambiguous: 0 < coverage < 0.1" in c for c in captions), captions
+    texts = [text.get_text() for text in plot_tile_labels(view, 256).texts]
+    caption = next(text for text in texts if "coverage" in text)
+    assert rule in caption
+    assert ("ambiguous" in caption) == (threshold > 0)
 
 
 @pytest.mark.parametrize(("threshold", "unpredicted"), [(None, 2), (0.5, 0)])
@@ -304,4 +310,25 @@ def test_a_fold_with_undefined_metrics_still_renders(
     fig = plot_prediction_errors(view, 256, held_out_predictions(cv), "M")
     labels = [text.get_text() for text in fig.legends[0].get_texts()]
     assert (f"{NO_PREDICTION} {unpredicted}" in labels) == bool(unpredicted)
-    assert any("fold AUPRC nan" in text.get_text() for text in fig.texts)
+    caption = next(text.get_text() for text in fig.texts if "fold AUPRC" in text.get_text())
+    assert "fold AUPRC undefined" in caption
+    if threshold is None:
+        assert "threshold undefined" in caption
+        assert "fold 1: no threshold recorded" in caption
+        assert "selected on the fold's inner validation" not in caption
+    else:
+        assert "threshold selected on the fold's inner validation" in caption
+
+
+def test_a_fold_without_a_threshold_is_named_beside_the_selected_ones(cut_dirs) -> None:
+    cuts, tiles = cut_dirs
+    view = load_cut_view(STEM, CUT, tile_sizes=(256,), cuts_dir=cuts, tiles_dir=tiles)
+    predictions = pd.DataFrame(
+        {"prob": [0.9, 0.9, 0.1], "fold": [1, 2, 2], "threshold": [0.5, np.nan, np.nan],
+         "fold_auprc": [0.9, np.nan, np.nan]},
+        index=pd.Index(["t_in", "t_edge", "t_out"], name="tile_id"),
+    )
+    fig = plot_prediction_errors(view, 256, predictions, "M")
+    caption = next(text.get_text() for text in fig.texts if "fold AUPRC" in text.get_text())
+    assert "threshold selected on the fold's inner validation" in caption
+    assert "fold 2: no threshold recorded, unambiguous tiles drawn as no prediction" in caption
