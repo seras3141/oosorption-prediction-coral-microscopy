@@ -33,7 +33,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--cuts", nargs="+", default=None,
                         help="Cut names, e.g. LHP_W_10_28-30_cut000. Default: every cut.")
-    parser.add_argument("--tile-sizes", type=int, nargs="+", default=[512, 1024],
+    parser.add_argument("--tile-sizes", type=int, nargs="+", default=[256, 512, 1024],
                         choices=(128, 256, 512, 1024))
     parser.add_argument("--models", nargs="+", default=list(MODELS), choices=list(MODELS))
     parser.add_argument("--figures", nargs="+", default=list(FIGURES), choices=FIGURES)

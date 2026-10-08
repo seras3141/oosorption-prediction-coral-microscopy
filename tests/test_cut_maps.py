@@ -397,3 +397,9 @@ def test_a_stale_sweep_run_does_not_hide_a_missing_default(tmp_path: Path) -> No
     _write_cv(tmp_path, PHIKON_PREFIX + "bbbb", {"lr": 5e-4}, partial=True)
     with pytest.raises(NoDefaultRunError):
         _lookup(tmp_path)
+
+
+def test_the_cli_draws_every_size_with_reference_runs_by_default() -> None:
+    import scripts.plot_cut_maps as cli
+
+    assert cli._parse_args([]).tile_sizes == [256, 512, 1024]
