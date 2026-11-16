@@ -327,3 +327,144 @@ def test_slide_with_no_tiles_at_the_requested_size_is_not_counted_as_present(
 
     index = load_tile_index(**paths, tile_sizes=(512,), allow_missing_slides=True)
     assert set(index["stem"]) == {"SLIDE_A"}
+
+
+def _empty_cut(root: Path, stem: str = "SLIDE_A") -> str:
+    """Add a second cut to ``stem`` whose annotation file has no features."""
+    cut = f"{stem}_cut001"
+    _write_json(root / "data" / "tiles" / stem / cut / f"{cut}_tile_manifest.json",
+                {"cut_name": cut, "stem": stem,
+                 "tiles": [_tile(cut, 512, 0, 0, 0, 0), _tile(cut, 512, 0, 1, 512, 0)]})
+    _write_json(root / "data" / "cuts" / stem / f"{cut}_annotations.geojson",
+                {"type": "FeatureCollection", "features": []})
+    return cut
+
+
+def _exclusions(excluded=(), known_empty=()):
+    from src.modeling.cut_exclusions import CutExclusions
+
+    return CutExclusions(frozenset(excluded), frozenset(known_empty), applied=True)
+
+
+def test_an_unlisted_cut_without_annotations_is_refused(tmp_path: Path) -> None:
+    paths = _corpus(tmp_path)
+    cut = _empty_cut(tmp_path)
+    with pytest.raises(ValueError, match=f"{cut} has no annotations.*the cut exclusion list "
+                                         "this index uses.*the list it recorded"):
+        load_tile_index(**paths, cut_exclusions=_exclusions())
+    (tmp_path / "data" / "cuts" / "SLIDE_A" / f"{cut}_annotations.geojson").unlink()
+    with pytest.raises(ValueError, match=f"{cut} has no annotation file.*as excluded"):
+        load_tile_index(**paths, cut_exclusions=_exclusions())
+    with pytest.raises(ValueError, match=f"{cut} is listed as known_empty but has no annotation "
+                                         "file.*add one with no features"):
+        load_tile_index(**paths, cut_exclusions=_exclusions(known_empty=[cut]))
+    assert cut not in set(load_tile_index(**paths, cut_exclusions=_exclusions(excluded=[cut]))
+                          ["cut_name"])
+
+
+def test_an_excluded_cut_contributes_no_tiles_and_is_logged(tmp_path: Path, caplog) -> None:
+    paths = _corpus(tmp_path)
+    cut = _empty_cut(tmp_path)
+    with caplog.at_level("INFO", logger="src.modeling.tile_index"):
+        index = load_tile_index(**paths, cut_exclusions=_exclusions(excluded=[cut]))
+    assert cut not in set(index["cut_name"])
+    assert len(index) == 6
+    messages = [record.getMessage() for record in caplog.records]
+    assert f"Leaving out {cut}: listed in the cut exclusions" in messages
+    assert any(m.startswith("Indexed 6 tiles from 2 cuts") for m in messages)
+
+
+def test_a_known_empty_cut_is_indexed_as_all_negative(tmp_path: Path) -> None:
+    paths = _corpus(tmp_path)
+    cut = _empty_cut(tmp_path)
+    index = load_tile_index(**paths, cut_exclusions=_exclusions(known_empty=[cut]))
+    assert set(index.loc[index["cut_name"] == cut, "label"]) == {"negative"}
+    assert (index["cut_name"] == cut).sum() == 2
+
+
+def test_by_default_and_on_the_legacy_corpus_an_unannotated_cut_is_indexed_as_before(
+        tmp_path: Path) -> None:
+    from src.modeling.cut_exclusions import LEGACY_CORPUS
+
+    paths = _corpus(tmp_path)
+    cut = _empty_cut(tmp_path)
+    for index in (load_tile_index(**paths), load_tile_index(**paths, cut_exclusions=LEGACY_CORPUS)):
+        assert set(index.loc[index["cut_name"] == cut, "label"]) == {"negative"}
+        assert len(index) == 8
+
+
+def test_a_listed_cut_that_is_not_found_is_refused_unless_for_a_subset_run(
+        tmp_path: Path, caplog) -> None:
+    paths = _corpus(tmp_path)
+    with pytest.raises(ValueError, match="SLIDE_A_cut009 is listed .* a typo, or a partially"):
+        load_tile_index(**paths, cut_exclusions=_exclusions(excluded=["SLIDE_A_cut009"]))
+    with caplog.at_level("WARNING", logger="src.modeling.tile_index"):
+        load_tile_index(**paths, cut_exclusions=_exclusions(excluded=["SLIDE_A_cut009"]),
+                        allow_missing_slides=True)
+    assert any("SLIDE_A_cut009 is listed" in r.getMessage() for r in caplog.records)
+    with pytest.raises(ValueError, match="split manifest has no slide SLIDE_X: a typo"):
+        load_tile_index(**paths, cut_exclusions=_exclusions(excluded=["SLIDE_X_cut000"]),
+                        allow_missing_slides=True)
+
+
+def test_a_known_empty_cut_that_has_annotations_is_refused(tmp_path: Path) -> None:
+    paths = _corpus(tmp_path)
+    with pytest.raises(ValueError, match="SLIDE_A_cut000 is listed as known_empty but has 1"):
+        load_tile_index(**paths, cut_exclusions=_exclusions(known_empty=["SLIDE_A_cut000"]))
+
+
+def test_excluding_every_cut_with_tiles_names_the_exclusions(tmp_path: Path) -> None:
+    paths = _corpus(tmp_path)
+    with pytest.raises(ValueError, match="left out every cut that has them"):
+        load_tile_index(**paths, cut_exclusions=_exclusions(
+            excluded=["SLIDE_A_cut000", "SLIDE_B_cut000"]))
+    with pytest.raises(ValueError, match=r"No tiles at sizes \[999\]"):
+        load_tile_index(**paths, tile_sizes=(999,),
+                        cut_exclusions=_exclusions(excluded=["SLIDE_A_cut000"]))
+
+
+def test_a_fully_excluded_slide_can_be_dropped_from_the_split_or_allowed(
+        tmp_path: Path) -> None:
+    paths = _corpus(tmp_path)
+    listed = _exclusions(excluded=["SLIDE_A_cut000"])
+    index = load_tile_index(**paths, cut_exclusions=listed, allow_missing_slides=True)
+    assert set(index["stem"]) == {"SLIDE_B"}
+    split = json.loads(paths["split_manifest_path"].read_text())
+    del split["slides"]["SLIDE_A"]
+    paths["split_manifest_path"].write_text(json.dumps(split))
+    assert set(load_tile_index(**paths, cut_exclusions=listed)["stem"]) == {"SLIDE_B"}
+
+
+def test_a_fully_excluded_slide_is_named_beside_the_other_missing_slides(tmp_path: Path) -> None:
+    paths = _corpus(tmp_path)
+    split = json.loads(paths["split_manifest_path"].read_text())
+    split["slides"]["SLIDE_C"] = {"split": "test", "location": "LHP", "stage_counts": {}}
+    paths["split_manifest_path"].write_text(json.dumps(split))
+    with pytest.raises(ValueError, match=r"2 slide\(s\) .*: SLIDE_A, SLIDE_C\. Every cut of "
+                                         r"SLIDE_A at these sizes is excluded"):
+        load_tile_index(**paths, cut_exclusions=_exclusions(excluded=["SLIDE_A_cut000"]))
+
+
+def _cut_tiled_only_at_128(root: Path, stem: str = "SLIDE_A") -> str:
+    cut = f"{stem}_cut002"
+    _write_json(root / "data" / "tiles" / stem / cut / f"{cut}_tile_manifest.json",
+                {"cut_name": cut, "stem": stem, "tiles": [_tile(cut, 128, 0, 0, 0, 0)]})
+    _write_json(root / "data" / "cuts" / stem / f"{cut}_annotations.geojson",
+                {"type": "FeatureCollection", "features": []})
+    return cut
+
+
+def test_the_guard_ignores_a_cut_with_no_tiles_at_the_requested_sizes(tmp_path: Path) -> None:
+    paths = _corpus(tmp_path)
+    cut = _cut_tiled_only_at_128(tmp_path)
+    assert len(load_tile_index(**paths, tile_sizes=(512,), cut_exclusions=_exclusions())) == 6
+    with pytest.raises(ValueError, match=f"{cut} has no annotations"):
+        load_tile_index(**paths, tile_sizes=(128,), cut_exclusions=_exclusions())
+
+
+def test_a_slide_is_named_as_excluded_when_its_other_cuts_lack_the_size(tmp_path: Path) -> None:
+    paths = _corpus(tmp_path)
+    _cut_tiled_only_at_128(tmp_path)
+    with pytest.raises(ValueError, match=r"Every cut of SLIDE_A at these sizes is excluded"):
+        load_tile_index(**paths, tile_sizes=(512,),
+                        cut_exclusions=_exclusions(excluded=["SLIDE_A_cut000"]))

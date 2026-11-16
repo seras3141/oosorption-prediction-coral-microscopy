@@ -24,6 +24,14 @@ from src.modeling.specimen_groups import (
     straddling_specimens,
     write_fold_manifests,
 )
+from src.modeling.cut_exclusions import (
+    DEFAULT_CUT_EXCLUSIONS,
+    CutExclusions,
+    cut_exclusion_fields,
+    cut_exclusions_from_flag,
+    cut_exclusions_recorded_in,
+    describe_cut_exclusions,
+)
 from src.modeling.tile_index import DEFAULT_SPLIT_MANIFEST, load_tile_index
 
 LOG_FORMAT = "[%(levelname)s] %(message)s"
@@ -40,6 +48,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--split-manifest", default=DEFAULT_SPLIT_MANIFEST,
         help="Slide-level manifest the tile index is built against; only its slide list "
              "is used, and its hash is recorded as provenance. Default: %(default)s.",
+    )
+    parser.add_argument(
+        "--cut-exclusions", default=DEFAULT_CUT_EXCLUSIONS,
+        help="CSV of cuts to leave out or confirmed empty, recorded in the manifest; "
+             "'none' indexes every cut. Default: %(default)s.",
     )
     parser.add_argument(
         "--output", type=Path, default=DEFAULT_OUTPUT,
@@ -83,6 +96,39 @@ def format_fold_table(fold_manifest: dict) -> str:
     return "\n".join(lines)
 
 
+def other_exclusions_at(
+    output: Path,
+    split_targets: list[Path],
+    exclusions: CutExclusions,
+    manifests: tuple[Path, ...] | None = None,
+) -> str | None:
+    """Why writing ``output`` and ``split_targets`` would orphan a fold manifest built with
+    another list: one at ``output``, or one in ``manifests`` (default: every JSON file in
+    ``output``'s folder and under ``data/splits``) whose split files would be overwritten."""
+    output = output.resolve()
+    targets = {target.resolve() for target in split_targets}
+    if manifests is None:
+        splits_root = REPO_ROOT / "data" / "splits"
+        manifests = (*output.parent.glob("*.json"), *splits_root.rglob("*.json"))
+    candidates = manifests
+    for manifest_path in sorted({output, *(path.resolve() for path in candidates)}):
+        if not manifest_path.exists():
+            continue
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if "folds" not in manifest:
+            continue
+        recorded = cut_exclusions_recorded_in(manifest)
+        if recorded == exclusions:
+            continue
+        uses = {(REPO_ROOT / fold["split_manifest_path"]).resolve() for fold in manifest["folds"]}
+        if manifest_path == output or uses & targets:
+            return (f"{manifest_path} was built with {describe_cut_exclusions(recorded)}; "
+                    f"writing a fold manifest with {describe_cut_exclusions(exclusions)} over it "
+                    "or its split files would orphan the runs made on it, even with --force. "
+                    "Pass a new --output and --split-dir.")
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the fold manifest generation CLI."""
     args = parse_args(argv)
@@ -96,7 +142,9 @@ def main(argv: list[str] | None = None) -> int:
     for specimen, splits in straddling.items():
         print(f"  {specimen}: {' + '.join(splits)}")
 
-    index = load_tile_index(split_manifest_path=split_path, tile_sizes=tuple(args.tile_sizes))
+    exclusions = cut_exclusions_from_flag(args.cut_exclusions)
+    index = load_tile_index(split_manifest_path=split_path, tile_sizes=tuple(args.tile_sizes),
+                            cut_exclusions=exclusions)
     counts = specimen_counts(index)
     assignment = assign_folds(counts, n_folds=args.n_folds)
     inner_val = choose_inner_val(counts, assignment)
@@ -107,6 +155,7 @@ def main(argv: list[str] | None = None) -> int:
         split_manifest_dir=args.split_dir.rstrip("/"),
         source_split_manifest_sha256=hashlib.sha256(split_path.read_bytes()).hexdigest(),
     )
+    fold_manifest.update(cut_exclusion_fields(exclusions))
     print(f"\n{fold_manifest['n_specimens']} specimens, {fold_manifest['n_slides']} slides, "
           f"{fold_manifest['n_folds']} folds")
     print(format_fold_table(fold_manifest))
@@ -115,7 +164,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     output = args.output if args.output.is_absolute() else REPO_ROOT / args.output
-    targets = [output] + [REPO_ROOT / f["split_manifest_path"] for f in fold_manifest["folds"]]
+    split_targets = [REPO_ROOT / f["split_manifest_path"] for f in fold_manifest["folds"]]
+    conflict = other_exclusions_at(output, split_targets, exclusions)
+    if conflict:
+        logging.error(conflict)
+        return 1
+    targets = [output] + split_targets
     existing = [t for t in targets if t.exists()]
     if existing and not args.force:
         logging.error("%s already exist(s); pass --force to overwrite",

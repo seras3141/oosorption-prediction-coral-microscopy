@@ -190,7 +190,7 @@ def test_prediction_log_requires_exact_val_and_test_sets() -> None:
 SYNTHETIC_TILE_IDS = {f"{stem}_t{i}" for stem in STEMS for i in range(4)}
 
 
-def _synthetic_scorable(*args, specimens=None) -> set[str]:
+def _synthetic_scorable(*args, specimens=None, cut_exclusions=None) -> set[str]:
     return {t for t in SYNTHETIC_TILE_IDS
             if specimens is None or t.rsplit("_", 2)[0] in specimens}
 
@@ -443,3 +443,35 @@ def test_recorded_cv_run_ids_survive_new_config_fields(tile_size: int, expected:
     manifest = load_fold_manifest()
     base = TrainingConfig(tile_size=tile_size, num_workers=7)
     assert cv_run_id(base, manifest["_sha256"]) == expected
+
+
+def test_a_run_and_its_fold_manifest_must_share_their_cut_exclusions() -> None:
+    from src.modeling.cut_exclusions import CutExclusions, cut_exclusion_fields
+
+    listed = cut_exclusion_fields(CutExclusions(frozenset({"S_cut000"}), applied=True))
+    other = cut_exclusion_fields(CutExclusions(frozenset({"S_cut001"}), applied=True))
+    with pytest.raises(ValueError, match=r"built with a cut exclusion list excluding \['S_cut000'\]"
+                                         r".*the run uses no cut exclusion list"):
+        fold_config(TrainingConfig(), {**_fold_manifest(), **listed}, 1)
+    with pytest.raises(ValueError, match=r"built with no cut exclusion list.*the run uses a cut "
+                                         r"exclusion list excluding \['S_cut000'\]"):
+        fold_config(TrainingConfig(**listed), _fold_manifest(), 1)
+    with pytest.raises(ValueError, match=r"S_cut001.*S_cut000"):
+        fold_config(TrainingConfig(**listed), {**_fold_manifest(), **other}, 1)
+    saved = json.loads(json.dumps(listed))
+    config = fold_config(TrainingConfig(**listed), {**_fold_manifest(), **saved}, 1)
+    assert config.excluded_cuts == ("S_cut000",)
+
+
+def test_scorable_tiles_default_to_the_list_the_fold_manifest_records(monkeypatch) -> None:
+    import src.modeling.tile_index as tile_index
+    from src.modeling.cross_validation import scorable_tile_ids
+    from src.modeling.cut_exclusions import LEGACY_CORPUS, CutExclusions, cut_exclusion_fields
+
+    passed = []
+    monkeypatch.setattr(tile_index, "load_tile_index", lambda **kwargs: passed.append(
+        kwargs["cut_exclusions"]) or pd.DataFrame(columns=list(tile_index.INDEX_COLUMNS)))
+    listed = CutExclusions(frozenset({"S_cut000"}), applied=True)
+    scorable_tile_ids({**_fold_manifest(), **cut_exclusion_fields(listed)}, 512, "area", 0.05)
+    scorable_tile_ids(_fold_manifest(), 512, "area", 0.05)
+    assert passed == [listed, LEGACY_CORPUS]

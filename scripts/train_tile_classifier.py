@@ -19,6 +19,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from src.modeling.cut_exclusions import (
+    DEFAULT_CUT_EXCLUSIONS,
+    cut_exclusion_fields,
+    cut_exclusions_from_flag,
+)
 from src.modeling.train_tile_classifier import ARCHITECTURES, TrainingConfig, train
 from src.modeling.encoders import DEFAULT_ENCODER, SUPPORTED_ENCODERS
 from src.modeling.tile_index import DEFAULT_SPLIT_MANIFEST, LABEL_RULES
@@ -103,6 +108,11 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         "--split-manifest", default=DEFAULT_SPLIT_MANIFEST,
         help="Slide-to-split manifest to train and validate against. Default: the v1 "
              "slide-level split, %(default)s. Cross-validation passes one per fold.",
+    )
+    parser.add_argument(
+        "--cut-exclusions", default=DEFAULT_CUT_EXCLUSIONS,
+        help="CSV of cuts to leave out or confirmed empty. 'none' indexes every cut, as\n"
+             "runs made before the list existed did, to reproduce them. Default: %(default)s.",
     )
     parser.add_argument(
         "--embedding-cache-dir", default=None,
@@ -216,6 +226,7 @@ def config_from_args(args: argparse.Namespace) -> TrainingConfig:
         split_manifest_path=args.split_manifest,
         embedding_cache_dir=args.embedding_cache_dir,
         quadrant_pooling=args.quadrant_pooling,
+        **cut_exclusion_fields(cut_exclusions_from_flag(args.cut_exclusions)),
         output_dir=args.output_dir,
     )
 

@@ -33,6 +33,13 @@ from src.modeling.tile_labels import (
     oocyte_area_fractions_for_manifest,
 )
 from src.modeling.cross_validation import DEFAULT_FOLD_MANIFEST, load_fold_manifest
+from src.modeling.cut_exclusions import (
+    LEGACY_CORPUS,
+    CutExclusions,
+    cut_exclusion_fields,
+    cut_exclusions_recorded_in,
+    describe_cut_exclusions,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CUTS_DIR = REPO_ROOT / "data" / "cuts"
@@ -180,12 +187,15 @@ MODELS = {
     "phikon": {"label": "Phikon-v2 (frozen, cached)", "prefix": "frozen_encoder_owkin-phikon-v2",
                "architecture": "frozen_encoder", "encoder_name": "owkin/phikon-v2", "cached": True},
 }
+CUT_EXCLUSION_FIELDS = ("excluded_cuts", "known_empty_cuts", "cut_exclusions_applied")
 UNCOMPARED_FIELDS = ("num_workers", "output_dir", "split_manifest_sha256", "embedding_cache_sha256")
 _ABSENT = object()
 
 
-def default_run_config(model: str, tile_size: int, seed: int = 42) -> dict[str, Any]:
-    """The recorded config a run of ``model`` under TrainingConfig's defaults would carry."""
+def default_run_config(model: str, tile_size: int, seed: int = 42,
+                       cut_exclusions: CutExclusions = LEGACY_CORPUS) -> dict[str, Any]:
+    """The recorded config a run of ``model`` under TrainingConfig's defaults, indexed with
+    ``cut_exclusions``, would carry."""
     # Deferred: label maps need no torch.
     from src.modeling.embedding_cache import cache_dir
     from src.modeling.train_tile_classifier import TrainingConfig, _path_relative_to_repo
@@ -193,21 +203,29 @@ def default_run_config(model: str, tile_size: int, seed: int = 42) -> dict[str, 
     spec = MODELS[model]
     config = asdict(TrainingConfig(architecture=spec["architecture"],
                                    encoder_name=spec["encoder_name"],
-                                   tile_size=tile_size, seed=seed))
+                                   tile_size=tile_size, seed=seed,
+                                   **cut_exclusion_fields(cut_exclusions)))
     if spec["cached"]:
         path = cache_dir(spec["encoder_name"], tile_size)
         config["embedding_cache_dir"] = _path_relative_to_repo(path)
     return config
 
 
-def _is_default(recorded: dict[str, Any], default: dict[str, Any]) -> bool:
+def _is_default(recorded: dict[str, Any], default: dict[str, Any],
+                ignored: tuple[str, ...] = ()) -> bool:
     from src.modeling.train_tile_classifier import TrainingConfig
 
     omitted = TrainingConfig.RUN_ID_OMITTED_AT_DEFAULT
-    keys = (set(recorded) | set(default)) - set(UNCOMPARED_FIELDS)
+    keys = (set(recorded) | set(default)) - set(UNCOMPARED_FIELDS) - set(ignored)
     return all(
-        recorded.get(key, omitted.get(key)) == default.get(key, _ABSENT) for key in keys
+        _as_tuple(recorded.get(key, omitted.get(key))) == _as_tuple(default.get(key, _ABSENT))
+        for key in keys
     )
+
+
+def _as_tuple(value: Any) -> Any:
+    # JSON records tuples as lists.
+    return tuple(value) if isinstance(value, list) else value
 
 
 class NoDefaultRunError(ValueError):
@@ -221,18 +239,22 @@ def find_default_cv_results(
     cv_dir: Path = REPO_ROOT / "data" / "tile_classifier_cv",
     fold_manifest: str | Path = DEFAULT_FOLD_MANIFEST,
 ) -> Path:
-    """The one full CV run of ``model`` at ``tile_size`` under TrainingConfig's defaults,
-    ignoring output path, content hashes and worker count; the last changes augmentation,
-    but the reference runs used 3 (Phikon-v2) and 7 (ResNet-18) workers."""
+    """The one full CV run of ``model`` at ``tile_size`` under TrainingConfig's defaults and
+    the cut exclusions the fold manifest records, ignoring output path, content hashes and
+    worker count; the last changes augmentation, but the reference runs used 3 (Phikon-v2)
+    and 7 (ResNet-18) workers."""
     spec = MODELS[model]
-    default = default_run_config(model, tile_size, seed)
-    folds_sha256 = load_fold_manifest(fold_manifest)["_sha256"]
-    matches, other_folds, partial = [], [], []
+    folds = load_fold_manifest(fold_manifest)
+    default = default_run_config(model, tile_size, seed, cut_exclusions_recorded_in(folds))
+    folds_sha256 = folds["_sha256"]
+    matches, other_folds, other_lists, partial = [], [], [], []
     for path in sorted(cv_dir.glob(f"{spec['prefix']}_{tile_size:04d}_*_seed{seed}_cv_*/cv_results.json")):
         cv = json.loads(path.read_text())
-        if cv["is_subset_run"] or not _is_default(cv["config"], default):
+        if cv["is_subset_run"] or not _is_default(cv["config"], default, CUT_EXCLUSION_FIELDS):
             continue
-        if cv.get("fold_manifest_sha256") != folds_sha256:
+        if not _is_default(cv["config"], default):
+            other_lists.append(path.parent.name)
+        elif cv.get("fold_manifest_sha256") != folds_sha256:
             other_folds.append(path.parent.name)
         elif cv["is_partial"]:
             partial.append(path.parent.name)
@@ -241,11 +263,14 @@ def find_default_cv_results(
     message = (
         f"expected one default {model} CV run at {tile_size} px, seed {seed}; found "
         f"{len(matches)}: {[p.parent.name for p in matches]}"
+        + (f"; skipped {other_lists} as made with another cut exclusion list than "
+           f"{describe_cut_exclusions(cut_exclusions_recorded_in(folds))}, which "
+           f"{fold_manifest} records" if other_lists else "")
         + (f"; skipped {other_folds} as run on other folds than {fold_manifest}"
            if other_folds else "")
         + (f"; skipped {partial} as partial" if partial else "")
     )
-    if not matches and not other_folds and not partial:
+    if not matches and not other_folds and not other_lists and not partial:
         raise NoDefaultRunError(message)
     if len(matches) != 1:
         raise ValueError(message)
