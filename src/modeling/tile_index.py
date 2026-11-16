@@ -1,14 +1,6 @@
-"""Build the tile-level training index: one row per tile, joined to its slide's split.
-
-Flattens the 77 per-cut tile manifests into a single table, attaches the
-geometry-derived oocyte label from :mod:`src.modeling.tile_labels`, and joins each tile
-to its parent slide's train/val/test assignment. Tiles are split by slide, never within
-a slide, so no oocyte can appear on both sides of the split.
-
-Deliberately free of ``torch`` -- see :mod:`src.modeling.tile_classification_dataset` for
-the tensor-serving layer. Keeping the two apart means the detection milestones can reuse
-this index and the corrected label without installing the ML stack.
-"""
+"""Build the tile-level training index: one row per tile, labelled from its cut's
+annotations and joined to its slide's split, so no oocyte crosses splits. Free of
+``torch``, so detection work can reuse it without the ML stack."""
 
 from __future__ import annotations
 
@@ -20,12 +12,14 @@ from typing import Any
 
 import pandas as pd
 
+from src.modeling.cut_exclusions import DEFAULT_CUT_EXCLUSIONS, LEGACY_CORPUS, CutExclusions
 from src.modeling.tile_labels import (
     DEFAULT_MIN_OOCYTE_AREA_FRACTION,
     LABEL_AMBIGUOUS,
     LABEL_NEGATIVE,
     LABEL_POSITIVE,
     label_for_area_fraction,
+    load_annotation_polygons,
     oocyte_area_fractions_for_manifest,
 )
 
@@ -64,6 +58,7 @@ def load_tile_index(
     label_rule: str = LABEL_RULE_AREA,
     min_oocyte_area_fraction: float = DEFAULT_MIN_OOCYTE_AREA_FRACTION,
     allow_missing_slides: bool = False,
+    cut_exclusions: CutExclusions = LEGACY_CORPUS,
 ) -> pd.DataFrame:
     """Build one indexed row per tile at the requested sizes.
 
@@ -85,27 +80,28 @@ def load_tile_index(
         Coverage at or above which an area-rule tile is positive. Ignored by the
         centroid rule.
     allow_missing_slides : bool, optional
-        Permit split-manifest slides that have no tiles. Off by default: `data/` is not
-        synced to every checkout, so a partially copied tile tree would otherwise yield
-        a quietly smaller val or test set and confidence intervals over fewer slides
-        than the split defines. Set it only for a deliberate subset run.
+        Permit split-manifest slides that have no tiles, for a deliberate subset run;
+        otherwise a partially copied tile tree would silently shrink the splits.
+    cut_exclusions : CutExclusions, optional
+        Cuts to leave out and cuts confirmed empty. Default:
+        ``LEGACY_CORPUS``, which indexes every cut, as before the list existed.
 
     Returns
     -------
     pandas.DataFrame
-        Columns :data:`INDEX_COLUMNS`. ``label`` is one of ``"positive"``,
-        ``"ambiguous"``, ``"negative"``; ``is_ambiguous`` is the same information as a
-        boolean, carried separately because filtering it is the common operation and a
-        caller that forgets would otherwise train on tiles this rule declines to call.
+        Columns :data:`INDEX_COLUMNS`. ``label`` is ``"positive"``, ``"ambiguous"`` or
+        ``"negative"``; ``is_ambiguous`` repeats it as the flag callers filter on.
 
     Raises
     ------
     ValueError
-        If ``label_rule`` is unknown, if no manifests are found, if ``tile_sizes``
-        matches no tile in any manifest, if a stem under ``tiles_dir`` is absent from the
-        split manifest -- an unassigned slide is a broken split, not a slide to quietly
-        drop -- or, unless ``allow_missing_slides``, if a slide in the split manifest has
-        no tiles.
+        If ``label_rule`` is unknown, no manifests or no tiles at ``tile_sizes`` are
+        found, a stem under ``tiles_dir`` is absent from the split manifest, or, unless
+        ``allow_missing_slides``, a split-manifest slide has no tiles. With an applied
+        exclusion list, also if a cut has no annotation file, an unlisted cut has no
+        annotations, a known-empty cut has annotations, the list excludes every cut with
+        tiles, or, unless ``allow_missing_slides``, a listed cut is not under
+        ``tiles_dir`` or every cut of a split-manifest slide is excluded.
 
     Examples
     --------
@@ -125,10 +121,23 @@ def load_tile_index(
 
     wanted = set(tile_sizes)
     seen_stems: set[str] = set()
+    manifest_cuts: dict[str, set[str]] = {}
+    sized_cuts: dict[str, set[str]] = {}
+    left_out: list[str] = []
     rows: list[dict[str, Any]] = []
     for manifest_path in manifest_paths:
         manifest = _read_json(Path(manifest_path))
         stem, cut_name = manifest["stem"], manifest["cut_name"]
+        manifest_cuts.setdefault(stem, set()).add(cut_name)
+        has_wanted = any(tile["tile_size"] in wanted for tile in manifest.get("tiles", []))
+        if has_wanted:
+            sized_cuts.setdefault(stem, set()).add(cut_name)
+        if cut_name in cut_exclusions.excluded:
+            LOG.info("Leaving out %s: %s", cut_name,
+                     cut_exclusions.reasons.get(cut_name) or "listed in the cut exclusions")
+            if has_wanted:
+                left_out.append(cut_name)
+            continue
         if stem not in slides:
             raise ValueError(
                 f"{stem} has tiles under {tiles_root} but no entry in the split "
@@ -136,12 +145,31 @@ def load_tile_index(
             )
         assigned = slides[stem]
         geojson_path = cuts_root / stem / f"{cut_name}_annotations.geojson"
+        checked = cut_exclusions.applied and has_wanted
+        if checked and not geojson_path.exists():
+            raise ValueError(
+                f"{cut_name} has no annotation file ({geojson_path}); list it as excluded "
+                f"in the cut exclusion list this index uses (the versioned list is "
+                f"{DEFAULT_CUT_EXCLUSIONS})."
+            )
+        polygons = load_annotation_polygons(geojson_path) if checked else None
+        if polygons and cut_name in cut_exclusions.known_empty:
+            raise ValueError(
+                f"{cut_name} is listed as known_empty but has {len(polygons)} annotated "
+                "oocyte(s); remove it from the cut exclusion list"
+            )
+        if polygons == [] and cut_name not in cut_exclusions.known_empty:
+            raise ValueError(
+                f"{cut_name} has no annotations. A cut the annotators skipped holds "
+                "oocytes nobody labelled, so it cannot be indexed as all negative: list it "
+                "as excluded in the cut exclusion list this index uses (the versioned list "
+                f"is {DEFAULT_CUT_EXCLUSIONS}), or as known_empty if it truly holds no "
+                "oocytes. A saved run indexes with the list it recorded."
+            )
 
         fractions: dict[str, float] = {}
         if label_rule == LABEL_RULE_AREA:
-            # Reuse the manifest already parsed above; these files embed per-tile
-            # annotation coordinates and total hundreds of megabytes, so parsing them
-            # twice per cut would dominate the cost of building the index.
+            # Reuse the parsed manifest; it is huge.
             fractions = oocyte_area_fractions_for_manifest(
                 manifest,
                 geojson_path,
@@ -152,9 +180,7 @@ def load_tile_index(
         for tile in manifest.get("tiles", []):
             if tile["tile_size"] not in wanted:
                 continue
-            # Marked here rather than per manifest: a slide whose cuts hold none of the
-            # requested sizes contributes no rows, and counting it as present would let
-            # it vanish from the index without tripping the evaluation-shrink guard.
+            # Per tile: tileless slides must trip guard.
             seen_stems.add(stem)
             fraction = fractions.get(tile["tile_id"]) if fractions else None
             label = _label_for_tile(tile, fraction, label_rule, min_oocyte_area_fraction)
@@ -174,6 +200,11 @@ def load_tile_index(
                 }
             )
 
+    if not rows and left_out:
+        raise ValueError(
+            f"No tiles left at sizes {sorted(wanted)} under {tiles_root}: the cut exclusion "
+            f"list left out every cut that has them ({', '.join(sorted(left_out))})"
+        )
     if not rows:
         raise ValueError(
             f"No tiles at sizes {sorted(wanted)} in any manifest under {tiles_root}; "
@@ -182,13 +213,31 @@ def load_tile_index(
             "later, where the cause is no longer visible."
         )
 
+    listed = cut_exclusions.excluded | cut_exclusions.known_empty
+    seen_cuts = set().union(*manifest_cuts.values())
+    for cut_name in sorted(listed - seen_cuts):
+        stem = cut_name.rsplit("_cut", 1)[0]
+        if stem not in slides:
+            raise ValueError(f"{cut_name} is listed in the cut exclusions, but the split "
+                             f"manifest has no slide {stem}: a typo")
+        message = (f"{cut_name} is listed in the cut exclusions but is not under "
+                   f"{tiles_root}: a typo, or a partially copied tile tree")
+        if not allow_missing_slides:
+            raise ValueError(f"{message}; pass allow_missing_slides=True for a deliberate "
+                             "subset run")
+        LOG.warning(message)
+
     missing = sorted(set(slides) - seen_stems)
+    # A missing slide's sized cuts were excluded.
+    excluded_slides = [stem for stem in missing if stem in sized_cuts]
     if missing and not allow_missing_slides:
         raise ValueError(
             f"{len(missing)} slide(s) in the split manifest contribute no tiles at "
-            f"sizes {sorted(wanted)} under {tiles_root}: {', '.join(missing)}. A partial "
-            "tile tree, or a size those slides were never tiled at, would silently "
-            "shrink the evaluation splits; pass allow_missing_slides=True for a "
+            f"sizes {sorted(wanted)} under {tiles_root}: {', '.join(missing)}. "
+            + (f"Every cut of {', '.join(excluded_slides)} at these sizes is excluded by the "
+               "cut exclusion list. " if excluded_slides else "")
+            + "A partial tile tree, or a size those slides were never tiled at, would "
+            "silently shrink the evaluation splits; pass allow_missing_slides=True for a "
             "deliberate subset run."
         )
     if missing:
@@ -202,7 +251,7 @@ def load_tile_index(
     LOG.info(
         "Indexed %d tiles from %d cuts at sizes %s under the %r rule",
         len(index),
-        len(manifest_paths),
+        index["cut_name"].nunique(),
         sorted(wanted),
         label_rule,
     )
@@ -228,8 +277,7 @@ def binary_targets(index: pd.DataFrame) -> pd.Series:
     Raises
     ------
     ValueError
-        If any ambiguous row is still present -- silently scoring those as negative
-        would inflate the negative pool with tiles the label rule declined to call.
+        If any ambiguous row is still present, rather than scoring it as negative.
     """
     if index["is_ambiguous"].any():
         raise ValueError(
