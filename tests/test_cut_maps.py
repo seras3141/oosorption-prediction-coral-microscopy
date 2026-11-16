@@ -413,3 +413,36 @@ def test_a_default_run_reloaded_from_json_still_counts_as_default() -> None:
     assert recorded["excluded_cuts"] == []
     assert _is_default(recorded, default)
     assert not _is_default({**recorded, "excluded_cuts": ["X_cut000"]}, default)
+
+
+def test_the_default_run_is_the_one_made_with_the_fold_manifests_cut_exclusions(
+        tmp_path: Path) -> None:
+    from src.modeling.cut_exclusions import CutExclusions, cut_exclusion_fields
+
+    listed = cut_exclusion_fields(CutExclusions(frozenset({"S_cut000"}), applied=True))
+    legacy_folds = _folds(tmp_path)
+    listed_folds = tmp_path / "fold_manifest_v2.json"
+    listed_folds.write_text(json.dumps({"folds": [], **listed}))
+    _write_cv(tmp_path, f"{PHIKON_PREFIX}legacy", fold_manifest=legacy_folds)
+    _write_cv(tmp_path, f"{PHIKON_PREFIX}listed", recorded=json.loads(json.dumps(listed)),
+              fold_manifest=listed_folds)
+    assert find_default_cv_results("phikon", 512, cv_dir=tmp_path,
+                                   fold_manifest=listed_folds).parent.name.endswith("listed")
+    assert find_default_cv_results("phikon", 512, cv_dir=tmp_path,
+                                   fold_manifest=legacy_folds).parent.name.endswith("legacy")
+
+
+def test_runs_made_with_another_cut_exclusion_list_are_named_not_reported_missing(
+        tmp_path: Path) -> None:
+    from src.modeling.cut_exclusions import CutExclusions, cut_exclusion_fields
+    from src.visualization.cut_maps import NoDefaultRunError
+
+    listed = cut_exclusion_fields(CutExclusions(frozenset({"S_cut000"}), applied=True))
+    listed_folds = tmp_path / "fold_manifest_v2.json"
+    listed_folds.write_text(json.dumps({"folds": [], **listed}))
+    _write_cv(tmp_path, f"{PHIKON_PREFIX}legacy", fold_manifest=_folds(tmp_path))
+    with pytest.raises(ValueError, match=r"skipped \['frozen_encoder\S+legacy'\] as made with "
+                                         r"another cut exclusion list than a cut exclusion list "
+                                         r"excluding \['S_cut000'\]") as raised:
+        find_default_cv_results("phikon", 512, cv_dir=tmp_path, fold_manifest=listed_folds)
+    assert not isinstance(raised.value, NoDefaultRunError)
