@@ -77,7 +77,7 @@ def test_reason_and_date_are_optional_as_values_and_as_columns(tmp_path: Path) -
     (HEADER, "A_cut000,dropped,blur,2026-10-27\n", "status 'dropped'"),
     (HEADER, " ,excluded,blur,2026-10-27\n", "'' is not a cut name"),
     (HEADER, "LHP_SU_9_13-15_cut00,excluded,,\n", "is not a cut name"),
-    (HEADER, '"A_cut000,excluded\nB_cut000",known_empty,,\n', "is not a cut name"),
+    (HEADER, '"A_cut000,excluded\nB_cut000",known_empty,,\n', "a field spans lines"),
     (HEADER, "A_cut000,,blur,2026-10-27\n", "status '' is not one of"),
     (HEADER, "A_cut000,excluded,not annotated, out of focus,2026-10-27\n",
      "more fields than the header"),
@@ -130,3 +130,22 @@ def test_blank_rows_and_an_empty_trailing_column_from_a_spreadsheet_are_ignored(
     with pytest.raises(ValueError, match="a column without a name"):
         load_cut_exclusions(_csv(tmp_path, "A_cut000,excluded,blur,2026-10-27,x\n",
                                  header="cut_name,status,reason,date,\n"))
+    with pytest.raises(ValueError, match="line 2: a value in a column without a name"):
+        load_cut_exclusions(_csv(tmp_path, "A_cut000,excluded,blur,2026-10-27,see ticket 12,\n",
+                                 header="cut_name,status,reason,date,,\n"))
+
+
+def test_a_quote_left_open_is_refused_rather_than_swallowing_the_rows_after_it(
+        tmp_path: Path) -> None:
+    path = _csv(tmp_path, 'A_cut000,excluded,"blur,2026-10-27\nB_cut001,excluded,x,2026-10-27\n')
+    with pytest.raises(ValueError, match="line 3: unexpected end of data"):
+        load_cut_exclusions(path)
+
+
+def test_a_quote_closed_in_a_later_row_is_refused(tmp_path: Path) -> None:
+    path = _csv(tmp_path, 'A_cut000,excluded,"blur,\nB_cut001,excluded,x,\nC_cut002,excluded,end",\n')
+    with pytest.raises(ValueError, match="a field spans lines"):
+        load_cut_exclusions(path)
+    longer = _csv(tmp_path, 'A_cut000,excluded,"blur\nB_cut001,excluded,x",2026-10-27,extra\n')
+    with pytest.raises(ValueError, match="a field spans lines"):
+        load_cut_exclusions(longer)

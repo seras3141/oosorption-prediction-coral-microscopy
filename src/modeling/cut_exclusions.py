@@ -9,6 +9,7 @@ import io
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CUT_EXCLUSIONS = "configs/cut_exclusions.csv"
@@ -57,14 +58,22 @@ def load_cut_exclusions(path: str | Path = DEFAULT_CUT_EXCLUSIONS) -> CutExclusi
     ------
     ValueError
         If ``cut_name`` or ``status`` is missing from the header, the header has any other
-        column, a row has more fields than the header, a cut is listed twice, a cut name is
-        not of the form ``<slide>_cutNNN``, or a status is unknown.
+        column, a quote is left open or spans lines, a row has more fields than the header, a cut is
+        listed twice, a cut name is not of the form ``<slide>_cutNNN``, or a status is
+        unknown.
     """
     resolved = Path(path) if Path(path).is_absolute() else REPO_ROOT / path
     # Spreadsheets save "CSV UTF-8" with a BOM.
-    reader = csv.DictReader(io.StringIO(resolved.read_bytes().decode("utf-8-sig")))
-    header = tuple(name.strip() for name in reader.fieldnames or ())
-    named = tuple(name for name in header if name)
+    rows = csv.reader(io.StringIO(resolved.read_bytes().decode("utf-8-sig")), strict=True)
+    try:
+        return _parse_rows(rows, resolved)
+    except csv.Error as error:
+        raise ValueError(f"{resolved} line {rows.line_num}: {error}") from error
+
+
+def _parse_rows(rows: Any, resolved: Path) -> CutExclusions:
+    header = [name.strip() for name in next(rows, [])]
+    named = [name for name in header if name]
     missing = [name for name in REQUIRED_COLUMNS if name not in named]
     unknown = [name for name in named if name not in REQUIRED_COLUMNS + OPTIONAL_COLUMNS]
     if missing or unknown or len(set(named)) != len(named):
@@ -72,20 +81,23 @@ def load_cut_exclusions(path: str | Path = DEFAULT_CUT_EXCLUSIONS) -> CutExclusi
             f"{resolved}: header needs {', '.join(REQUIRED_COLUMNS)} and may add "
             f"{', '.join(OPTIONAL_COLUMNS)}; got {', '.join(header)}"
         )
-    reader.fieldnames = list(header)
+    position = {name: header.index(name) for name in named}
+    unnamed = [i for i, name in enumerate(header) if not name]
     statuses: dict[str, str] = {}
     reasons: dict[str, str] = {}
-    for row in reader:
-        where = f"{resolved} line {reader.line_num}"
-        if None in row:
+    for row in rows:
+        where = f"{resolved} line {rows.line_num}"
+        if any("\n" in value or "\r" in value for value in row):
+            raise ValueError(f"{where}: a field spans lines; close the quote it opens")
+        if len(row) > len(header):
             raise ValueError(f"{where}: more fields than the header; quote a reason that "
                              "contains a comma")
-        if row.get("", "").strip():
+        if any(row[i].strip() for i in unnamed if i < len(row)):
             raise ValueError(f"{where}: a value in a column without a name")
-        if not any((value or "").strip() for value in row.values()):
+        if not any(value.strip() for value in row):
             continue
-        cut_name = (row["cut_name"] or "").strip()
-        status = (row["status"] or "").strip()
+        field_of = {name: row[i].strip() if i < len(row) else "" for name, i in position.items()}
+        cut_name, status = field_of["cut_name"], field_of["status"]
         if not CUT_NAME.fullmatch(cut_name):
             raise ValueError(f"{where}: {cut_name!r} is not a cut name like "
                              "LHP_SU_9_13-15_cut000")
@@ -94,7 +106,7 @@ def load_cut_exclusions(path: str | Path = DEFAULT_CUT_EXCLUSIONS) -> CutExclusi
         if cut_name in statuses:
             raise ValueError(f"{where}: {cut_name} is listed twice")
         statuses[cut_name] = status
-        reasons[cut_name] = (row.get("reason") or "").strip()
+        reasons[cut_name] = field_of.get("reason", "")
     return CutExclusions(
         excluded=frozenset(c for c, s in statuses.items() if s == EXCLUDED),
         known_empty=frozenset(c for c, s in statuses.items() if s == KNOWN_EMPTY),
