@@ -403,3 +403,13 @@ def test_the_cli_draws_every_size_with_reference_runs_by_default() -> None:
     import scripts.plot_cut_maps as cli
 
     assert cli._parse_args([]).tile_sizes == [256, 512, 1024]
+
+
+def test_a_default_run_reloaded_from_json_still_counts_as_default() -> None:
+    from src.visualization.cut_maps import _is_default, default_run_config
+
+    default = default_run_config("resnet18", 512)
+    recorded = json.loads(json.dumps(default))
+    assert recorded["excluded_cuts"] == []
+    assert _is_default(recorded, default)
+    assert not _is_default({**recorded, "excluded_cuts": ["X_cut000"]}, default)

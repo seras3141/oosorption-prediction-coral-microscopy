@@ -146,6 +146,11 @@ def load_tile_index(
         assigned = slides[stem]
         geojson_path = cuts_root / stem / f"{cut_name}_annotations.geojson"
         checked = cut_exclusions.applied and has_wanted
+        if checked and not geojson_path.exists() and cut_name in cut_exclusions.known_empty:
+            raise ValueError(
+                f"{cut_name} is listed as known_empty but has no annotation file "
+                f"({geojson_path}); add one with no features"
+            )
         if checked and not geojson_path.exists():
             raise ValueError(
                 f"{cut_name} has no annotation file ({geojson_path}); list it as excluded "
@@ -228,14 +233,13 @@ def load_tile_index(
         LOG.warning(message)
 
     missing = sorted(set(slides) - seen_stems)
-    # A missing slide's sized cuts were excluded.
-    excluded_slides = [stem for stem in missing if stem in sized_cuts]
+    fully_excluded_slides = [stem for stem in missing if stem in sized_cuts]
     if missing and not allow_missing_slides:
         raise ValueError(
             f"{len(missing)} slide(s) in the split manifest contribute no tiles at "
             f"sizes {sorted(wanted)} under {tiles_root}: {', '.join(missing)}. "
-            + (f"Every cut of {', '.join(excluded_slides)} at these sizes is excluded by the "
-               "cut exclusion list. " if excluded_slides else "")
+            + (f"Every cut of {', '.join(fully_excluded_slides)} at these sizes is excluded by the "
+               "cut exclusion list. " if fully_excluded_slides else "")
             + "A partial tile tree, or a size those slides were never tiled at, would "
             "silently shrink the evaluation splits; pass allow_missing_slides=True for a "
             "deliberate subset run."

@@ -206,8 +206,14 @@ def _is_default(recorded: dict[str, Any], default: dict[str, Any]) -> bool:
     omitted = TrainingConfig.RUN_ID_OMITTED_AT_DEFAULT
     keys = (set(recorded) | set(default)) - set(UNCOMPARED_FIELDS)
     return all(
-        recorded.get(key, omitted.get(key)) == default.get(key, _ABSENT) for key in keys
+        _as_tuple(recorded.get(key, omitted.get(key))) == _as_tuple(default.get(key, _ABSENT))
+        for key in keys
     )
+
+
+def _as_tuple(value: Any) -> Any:
+    # JSON records tuples as lists.
+    return tuple(value) if isinstance(value, list) else value
 
 
 class NoDefaultRunError(ValueError):

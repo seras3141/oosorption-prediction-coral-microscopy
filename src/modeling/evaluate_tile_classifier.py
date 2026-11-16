@@ -257,6 +257,7 @@ def evaluate(
         tile_sizes=(config.tile_size,),
         label_rule=config.label_rule,
         min_oocyte_area_fraction=scoring_area_fraction,
+        cut_exclusions=config.cut_exclusions(),
     )
     ambiguous = _ambiguous_counts(index)
     scored = training_rows(index)
@@ -291,6 +292,7 @@ def evaluate(
             tile_sizes=(config.tile_size,),
             label_rule=config.label_rule,
             min_oocyte_area_fraction=config.min_oocyte_area_fraction,
+            cut_exclusions=config.cut_exclusions(),
         )
         train_summary = _train_summary(training_rows(trained_index), config)
     else:

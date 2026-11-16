@@ -353,9 +353,11 @@ def test_an_unlisted_cut_without_annotations_is_refused(tmp_path: Path) -> None:
                                          "this index uses.*the list it recorded"):
         load_tile_index(**paths, cut_exclusions=_exclusions())
     (tmp_path / "data" / "cuts" / "SLIDE_A" / f"{cut}_annotations.geojson").unlink()
-    for listed in (_exclusions(), _exclusions(known_empty=[cut])):
-        with pytest.raises(ValueError, match=f"{cut} has no annotation file.*as excluded"):
-            load_tile_index(**paths, cut_exclusions=listed)
+    with pytest.raises(ValueError, match=f"{cut} has no annotation file.*as excluded"):
+        load_tile_index(**paths, cut_exclusions=_exclusions())
+    with pytest.raises(ValueError, match=f"{cut} is listed as known_empty but has no annotation "
+                                         "file.*add one with no features"):
+        load_tile_index(**paths, cut_exclusions=_exclusions(known_empty=[cut]))
     assert cut not in set(load_tile_index(**paths, cut_exclusions=_exclusions(excluded=[cut]))
                           ["cut_name"])
 

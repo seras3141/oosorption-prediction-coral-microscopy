@@ -119,3 +119,39 @@ def _listing_sha256(statuses: dict[str, str]) -> str:
     # Only names and statuses define the corpus.
     listing = "".join(f"{cut},{status}\n" for cut, status in sorted(statuses.items()))
     return hashlib.sha256(listing.encode("utf-8")).hexdigest()
+
+
+def cut_exclusions_from_flag(value: str) -> CutExclusions:
+    """``none`` for the legacy corpus, else the path of an exclusion CSV."""
+    return LEGACY_CORPUS if value == "none" else load_cut_exclusions(value)
+
+
+def cut_exclusion_fields(exclusions: CutExclusions) -> dict[str, object]:
+    """What a run or a fold manifest records about the cut exclusions it used."""
+    return {
+        "excluded_cuts": tuple(sorted(exclusions.excluded)),
+        "known_empty_cuts": tuple(sorted(exclusions.known_empty)),
+        "cut_exclusions_applied": exclusions.applied,
+    }
+
+
+def recorded_cut_exclusions(
+    excluded: tuple[str, ...], known_empty: tuple[str, ...], applied: bool
+) -> CutExclusions:
+    """The cut exclusions a run or fold manifest recorded."""
+    return CutExclusions(frozenset(excluded), frozenset(known_empty), applied=applied)
+
+
+def cut_exclusions_recorded_in(record: dict[str, Any]) -> CutExclusions:
+    """The exclusions a fold manifest records; one without the fields is the legacy corpus."""
+    return recorded_cut_exclusions(tuple(record.get("excluded_cuts", ())),
+                                   tuple(record.get("known_empty_cuts", ())),
+                                   bool(record.get("cut_exclusions_applied", False)))
+
+
+def describe_cut_exclusions(exclusions: CutExclusions) -> str:
+    """The exclusions in words, for error messages."""
+    if not exclusions.applied:
+        return "no cut exclusion list (the legacy corpus)"
+    return (f"a cut exclusion list excluding {sorted(exclusions.excluded) or 'nothing'} "
+            f"and confirming empty {sorted(exclusions.known_empty) or 'nothing'}")

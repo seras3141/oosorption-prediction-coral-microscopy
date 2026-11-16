@@ -17,6 +17,7 @@ from src.modeling.specimen_groups import specimen_of
 from src.modeling.tile_index import _resolve_repo_path
 
 if TYPE_CHECKING:
+    from src.modeling.cut_exclusions import CutExclusions
     from src.modeling.train_tile_classifier import TrainingConfig
 
 LOG = logging.getLogger(__name__)
@@ -59,6 +60,16 @@ def fold_config(
         raise ValueError(
             f"the base configuration already names {base.split_manifest_path}; "
             "cross-validation sets the split manifest per fold"
+        )
+    from src.modeling.cut_exclusions import cut_exclusions_recorded_in, describe_cut_exclusions
+
+    manifest_list = cut_exclusions_recorded_in(fold_manifest)
+    if manifest_list != base.cut_exclusions():
+        raise ValueError(
+            f"the fold manifest was built with {describe_cut_exclusions(manifest_list)}, but "
+            f"the run uses {describe_cut_exclusions(base.cut_exclusions())}; run with the fold "
+            "manifest's list (--cut-exclusions none for the legacy corpus), or use a fold "
+            "manifest built with the run's list"
         )
     entry = _fold_entry(fold_manifest, fold)
     # load_fold_manifest already verified this file.
@@ -153,6 +164,7 @@ def run_fold(
         tile_sizes=(config.tile_size,),
         label_rule=config.label_rule,
         min_oocyte_area_fraction=config.min_oocyte_area_fraction,
+        cut_exclusions=config.cut_exclusions(),
     )
     found = check_fold_isolation(index, fold_manifest, fold)
     LOG.info("Fold %d isolated: test %s, val %s", fold, found.get("test"), found.get("val"))
@@ -278,6 +290,7 @@ def aggregate(
     expected = scorable_tile_ids(
         fold_manifest, base.tile_size, label_rule, area_fraction,
         specimens=held_out_specimens if missing else None,
+        cut_exclusions=base.cut_exclusions(),
     )
     n_held_out = check_coverage(held_out, expected)
 
@@ -335,8 +348,11 @@ def scorable_tile_ids(
     label_rule: str,
     min_oocyte_area_fraction: float,
     specimens: set[str] | None = None,
+    cut_exclusions: CutExclusions | None = None,
 ) -> set[str]:
-    """Return every tile scorable at this size and labelling, optionally per specimen."""
+    """Return every tile scorable at this size and labelling, optionally per specimen;
+    ``cut_exclusions`` defaults to the list the fold manifest records."""
+    from src.modeling.cut_exclusions import cut_exclusions_recorded_in
     from src.modeling.tile_index import load_tile_index, training_rows
 
     # Any fold manifest lists every slide.
@@ -345,6 +361,8 @@ def scorable_tile_ids(
         tile_sizes=(tile_size,),
         label_rule=label_rule,
         min_oocyte_area_fraction=min_oocyte_area_fraction,
+        cut_exclusions=(cut_exclusions_recorded_in(fold_manifest) if cut_exclusions is None
+                        else cut_exclusions),
     )
     scorable = training_rows(index)
     if specimens is not None:

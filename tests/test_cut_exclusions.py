@@ -15,7 +15,9 @@ if str(REPO_ROOT) not in sys.path:
 from src.modeling.cut_exclusions import (
     DEFAULT_CUT_EXCLUSIONS,
     LEGACY_CORPUS,
+    cut_exclusion_fields,
     load_cut_exclusions,
+    recorded_cut_exclusions,
 )
 
 HEADER = "cut_name,status,reason,date\n"
@@ -149,3 +151,94 @@ def test_a_quote_closed_in_a_later_row_is_refused(tmp_path: Path) -> None:
     longer = _csv(tmp_path, 'A_cut000,excluded,"blur\nB_cut001,excluded,x",2026-10-27,extra\n')
     with pytest.raises(ValueError, match="a field spans lines"):
         load_cut_exclusions(longer)
+
+
+def test_recorded_exclusions_round_trip(tmp_path: Path) -> None:
+    exclusions = load_cut_exclusions(_csv(tmp_path, "A_cut000,excluded,blur,2026-10-27\n"))
+    fields = cut_exclusion_fields(exclusions)
+    restored = recorded_cut_exclusions(fields["excluded_cuts"], fields["known_empty_cuts"],
+                                       fields["cut_exclusions_applied"])
+    assert restored == exclusions and restored.sha256 == exclusions.sha256
+    assert recorded_cut_exclusions((), (), False) == LEGACY_CORPUS
+
+
+def test_a_config_saved_before_the_list_keeps_its_run_id_and_corpus() -> None:
+    from dataclasses import asdict
+
+    from src.modeling.train_tile_classifier import TrainingConfig
+
+    new_fields = ("excluded_cuts", "known_empty_cuts", "cut_exclusions_applied")
+    saved = {key: value for key, value in asdict(TrainingConfig()).items() if key not in new_fields}
+    reloaded = TrainingConfig(**saved)
+    assert reloaded.run_id() == TrainingConfig().run_id()
+    assert reloaded.cut_exclusions() == LEGACY_CORPUS
+
+
+def test_a_run_with_exclusions_gets_its_own_id_and_reloads_with_it(tmp_path: Path) -> None:
+    from dataclasses import asdict
+
+    from src.modeling.train_tile_classifier import TrainingConfig
+
+    exclusions = load_cut_exclusions(_csv(tmp_path, "A_cut000,excluded,blur,2026-10-27\n"))
+    config = TrainingConfig(**cut_exclusion_fields(exclusions))
+    assert config.run_id() != TrainingConfig().run_id()
+    empty_list = TrainingConfig(**cut_exclusion_fields(load_cut_exclusions(_csv(tmp_path, ""))))
+    assert empty_list.run_id() != TrainingConfig().run_id()
+    as_json = {**asdict(config), "excluded_cuts": ["A_cut000"], "known_empty_cuts": []}
+    reloaded = TrainingConfig(**as_json)
+    assert reloaded.run_id() == config.run_id()
+    assert reloaded.cut_exclusions() == exclusions
+
+
+def test_the_training_flag_records_the_csv_or_the_legacy_corpus(tmp_path: Path) -> None:
+    from scripts.train_tile_classifier import build_parser, config_from_args
+
+    path = _csv(tmp_path, "A_cut000,excluded,blur,2026-10-27\n")
+    config = config_from_args(build_parser().parse_args(["--cut-exclusions", str(path)]))
+    assert config.excluded_cuts == ("A_cut000",) and config.cut_exclusions_applied
+    legacy = config_from_args(build_parser().parse_args(["--cut-exclusions", "none"]))
+    assert legacy.cut_exclusions() == LEGACY_CORPUS
+    default = config_from_args(build_parser().parse_args([]))
+    assert default.excluded_cuts == ("LHP_SU_9_13-15_cut000",)
+
+
+def test_a_fold_manifest_built_with_another_list_is_never_overwritten(tmp_path: Path,
+                                                                      monkeypatch) -> None:
+    import json
+
+    import scripts.generate_fold_manifest as cli
+
+    listed = load_cut_exclusions(_csv(tmp_path, "A_cut000,excluded,,\n"))
+    output = tmp_path / "fold_manifest.json"
+    assert cli.other_exclusions_at(output, [], listed, manifests=()) is None
+    output.write_text(json.dumps({"folds": []}))
+    assert cli.other_exclusions_at(output, [], LEGACY_CORPUS, manifests=()) is None
+    assert "orphan the runs made on it" in cli.other_exclusions_at(output, [], listed, manifests=())
+
+    split_file = tmp_path / "cv-v1" / "fold1_split_manifest.json"
+    v1 = tmp_path / "v1_fold_manifest.json"
+    v1.write_text(json.dumps({"folds": [{"split_manifest_path": str(split_file)}]}))
+    new_output = tmp_path / "fold_manifest_v2.json"
+    assert str(v1) in cli.other_exclusions_at(new_output, [split_file], listed, manifests=(v1,))
+    assert cli.other_exclusions_at(new_output, [tmp_path / "cv-v2" / "fold1.json"], listed,
+                                   manifests=(v1,)) is None
+    roundabout = tmp_path / "other" / ".." / "cv-v1" / "fold1_split_manifest.json"
+    assert cli.other_exclusions_at(new_output, [roundabout], listed, manifests=(v1,))
+    assert str(v1) in cli.other_exclusions_at(new_output, [split_file], listed)
+    monkeypatch.setattr(cli, "REPO_ROOT", tmp_path)
+    elsewhere = tmp_path / "v2" / "fold_manifest.json"
+    (tmp_path / "data" / "splits").mkdir(parents=True)
+    v1.rename(tmp_path / "data" / "splits" / "fold_manifest.json")
+    assert "fold_manifest.json" in cli.other_exclusions_at(elsewhere, [split_file], listed)
+
+    split = tmp_path / "split.json"
+    split.write_text(json.dumps({"slides": {}}))
+    for name in ("load_tile_index", "specimen_counts", "assign_folds", "choose_inner_val"):
+        monkeypatch.setattr(cli, name, lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "build_fold_manifest", lambda *args, **kwargs: {
+        "n_specimens": 0, "n_slides": 0, "n_folds": 0, "folds": []})
+    monkeypatch.setattr(cli, "format_fold_table", lambda manifest: "")
+    before = output.read_text()
+    assert cli.main(["--split-manifest", str(split), "--output", str(output), "--force",
+                     "--cut-exclusions", str(tmp_path / "cut_exclusions.csv")]) == 1
+    assert output.read_text() == before

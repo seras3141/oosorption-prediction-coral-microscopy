@@ -36,6 +36,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
+from src.modeling.cut_exclusions import CutExclusions, recorded_cut_exclusions
 from src.modeling.encoders import (
     DEFAULT_ENCODER,
     DEFAULT_HEAD_DROPOUT,
@@ -125,6 +126,10 @@ class TrainingConfig:
     embedding_cache_dir: str | None = None
     embedding_cache_sha256: str | None = None
     quadrant_pooling: str = "mean"
+    #: Not applied means the legacy corpus.
+    excluded_cuts: tuple[str, ...] = ()
+    known_empty_cuts: tuple[str, ...] = ()
+    cut_exclusions_applied: bool = False
     output_dir: str = "data/tile_classifier"
 
     #: Fields that do not change a run's numbers and so stay out of its fingerprint.
@@ -143,6 +148,9 @@ class TrainingConfig:
         "embedding_cache_dir": None,
         "embedding_cache_sha256": None,
         "quadrant_pooling": "mean",
+        "excluded_cuts": (),
+        "known_empty_cuts": (),
+        "cut_exclusions_applied": False,
     }
 
     def __post_init__(self) -> None:
@@ -192,6 +200,16 @@ class TrainingConfig:
         )
         self._bind_split_manifest()
         self._resolve_embedding_cache()
+        # JSON reloads tuples as lists.
+        self.excluded_cuts = tuple(sorted(self.excluded_cuts))
+        self.known_empty_cuts = tuple(sorted(self.known_empty_cuts))
+        self.cut_exclusions()
+
+    def cut_exclusions(self) -> CutExclusions:
+        """The cut exclusions this run indexes with."""
+        return recorded_cut_exclusions(
+            self.excluded_cuts, self.known_empty_cuts, self.cut_exclusions_applied
+        )
 
     def _resolve_embedding_cache(self) -> None:
         """Validate the cached-embedding options and bind the cache's contents."""
@@ -461,6 +479,7 @@ def prepare_splits(config: TrainingConfig) -> dict[str, pd.DataFrame]:
             tile_sizes=(config.tile_size,),
             label_rule=config.label_rule,
             min_oocyte_area_fraction=config.min_oocyte_area_fraction,
+            cut_exclusions=config.cut_exclusions(),
         )
     )
     splits: dict[str, pd.DataFrame] = {}
