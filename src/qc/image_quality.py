@@ -13,6 +13,8 @@ from src.modeling.tile_index import _resolve_repo_path
 QUALITY_TILES_PER_CUT = 60
 QUALITY_SEED = 2026
 BACKGROUND_GREY = 0.8
+# Tiling's tissue_sat_min, on 0-255.
+TISSUE_SAT_MIN = 15
 MIN_TISSUE_SHARE = 0.05
 EDGE_ERODE_PX = 2
 LUMA = np.array([0.299, 0.587, 0.114], dtype=np.float32)
@@ -23,19 +25,40 @@ BLURRED = "blurred"
 TOO_FEW_TILES = "too few tiles"
 
 
-def tile_image_stats(image: np.ndarray) -> dict[str, float] | None:
-    """Brightness, saturation, red and blue over the tissue pixels of an RGB tile, and sharpness
-    (variance of the Laplacian of grey) over tissue away from its edges, so tissue outline does
-    not count as focus — NaN when no tissue lies that far from an edge; ``None`` when under 5 %
-    is tissue. Black padding is not tissue."""
-    rgb = np.asarray(image, dtype=np.float32)[..., :3] / 255
-    grey = rgb @ LUMA
+def tissue_mask(image: np.ndarray) -> np.ndarray:
+    """Tissue pixels of an RGB image on 0-255: stained, with HSV saturation of at least 15
+    (tiling's threshold, without its pre-blur), and darker than glass. Neutral grey glass or
+    medium, anything as bright as glass, and black padding are not tissue."""
+    rgb = _unit_rgb(image)
+    return _tissue(_saturation(rgb), rgb @ LUMA)
+
+
+def _tissue(saturation: np.ndarray, grey: np.ndarray) -> np.ndarray:
+    # OpenCV rounds S before tiling compares it.
+    return (saturation >= (TISSUE_SAT_MIN - 0.5) / 255) & (grey < BACKGROUND_GREY)
+
+
+def _unit_rgb(image: np.ndarray) -> np.ndarray:
+    return np.asarray(image, dtype=np.float32)[..., :3] / 255
+
+
+def _saturation(rgb: np.ndarray) -> np.ndarray:
     high, low = rgb.max(axis=2), rgb.min(axis=2)
-    tissue = (grey < BACKGROUND_GREY) & (high > 0)
+    return np.where(high > 0, (high - low) / np.maximum(high, 1e-6), 0)
+
+
+def tile_image_stats(image: np.ndarray) -> dict[str, float] | None:
+    """Brightness, saturation, red and blue over the :func:`tissue_mask` pixels of an RGB tile,
+    and sharpness (variance of the Laplacian of grey) over tissue away from its edges, so tissue
+    outline does not count as focus — NaN when no tissue lies that far from an edge; ``None``
+    when under 5 % is tissue."""
+    rgb = _unit_rgb(image)
+    grey = rgb @ LUMA
+    saturation = _saturation(rgb)
+    tissue = _tissue(saturation, grey)
     if tissue.mean() < MIN_TISSUE_SHARE:
         return None
     interior = ndimage.binary_erosion(tissue, iterations=EDGE_ERODE_PX)
-    saturation = np.where(high > 0, (high - low) / np.maximum(high, 1e-6), 0)
     return {"brightness": float(grey[tissue].mean()),
             "saturation": float(saturation[tissue].mean()),
             "red": float(rgb[..., 0][tissue].mean()),

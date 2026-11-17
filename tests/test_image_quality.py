@@ -14,19 +14,23 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.modeling import tile_index
 from src.modeling.cut_exclusions import CutExclusions
-from src.qc.image_quality import cut_image_quality, flag_cuts, tile_image_stats
+from src.qc.image_quality import cut_image_quality, flag_cuts, tile_image_stats, tissue_mask
 
 
 def _tile(colour: tuple[int, int, int], size: int = 32) -> np.ndarray:
     return np.tile(np.array(colour, dtype=np.uint8), (size, size, 1))
 
 
+def _board(size: int = 32) -> np.ndarray:
+    board = _tile((60, 20, 80), size)
+    board[::2, ::2] = (160, 60, 180)
+    return board
+
+
 def test_a_flat_tile_has_no_sharpness_and_a_checkerboard_has_some() -> None:
     flat = tile_image_stats(_tile((120, 60, 140)))
     assert flat["sharpness"] == 0.0
-    board = _tile((40, 40, 40))
-    board[::2, ::2] = 140
-    assert tile_image_stats(board)["sharpness"] > 0
+    assert tile_image_stats(_board())["sharpness"] > 0
 
 
 def test_tile_stats_measure_tissue_pixels_only() -> None:
@@ -91,8 +95,7 @@ def test_tiles_of_different_sizes_are_refused(tmp_path: Path) -> None:
 
 
 def test_sharpness_ignores_the_background_share_of_a_tile() -> None:
-    board = _tile((40, 40, 40), size=64)
-    board[::2, ::2] = 140
+    board = _board(64)
     half = board.copy()
     half[:, 32:] = 250
     full, partial = tile_image_stats(board)["sharpness"], tile_image_stats(half)["sharpness"]
@@ -101,8 +104,7 @@ def test_sharpness_ignores_the_background_share_of_a_tile() -> None:
 
 def test_black_padding_is_not_tissue() -> None:
     image = _tile((250, 250, 250), size=64)
-    image[:, :32] = (40, 40, 40)
-    image[:, :32][::2, ::2] = 140
+    image[:, :32] = _board(64)[:, :32]
     padded = image.copy()
     padded[:, 32:] = 0
     plain, with_padding = tile_image_stats(image), tile_image_stats(padded)
@@ -118,6 +120,31 @@ def test_sharpness_tiles_count_only_tiles_that_give_a_sharpness(tmp_path: Path) 
     Image.fromarray(thin).save(tiles["png_path"].iloc[0])
     table = cut_image_quality(tiles)
     assert table.loc[0, ["tiles_measured", "sharpness_tiles"]].tolist() == [2, 1]
+
+
+def test_grey_glass_and_mounting_medium_are_not_tissue() -> None:
+    image = _board(64)
+    tissue_only = image.copy()
+    tissue_only[:, 32:] = 250
+    image[:, 32:] = 100
+    image[::4, 32::4] = 140
+    with_grey, plain = tile_image_stats(image), tile_image_stats(tissue_only)
+    assert with_grey["brightness"] == pytest.approx(plain["brightness"])
+    assert with_grey["sharpness"] == pytest.approx(plain["sharpness"], rel=0.05)
+
+
+def test_the_tissue_mask_keeps_stained_pixels_darker_than_glass() -> None:
+    pixels = np.array([[(120, 60, 140), (17, 16, 16), (100, 100, 100), (245, 230, 235),
+                        (0, 0, 0), (250, 250, 250)]], dtype=np.uint8)
+    assert tissue_mask(pixels).tolist() == [[True, True, False, False, False, False]]
+
+
+def test_bright_tinted_glass_is_not_tissue() -> None:
+    image = _tile((245, 230, 235))
+    image[8:24, 8:24] = (120, 60, 140)
+    stats = tile_image_stats(image)
+    assert stats["red"] == pytest.approx(120 / 255)
+    assert stats["sharpness"] == pytest.approx(0.0)
 
 
 def test_a_flat_tissue_block_on_background_has_no_sharpness() -> None:

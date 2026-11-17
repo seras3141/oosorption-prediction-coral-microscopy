@@ -24,8 +24,8 @@ STEM = "S_A_1_1-2"
 
 def _tiles(tmp_path: Path) -> pd.DataFrame:
     flat = np.tile(np.array((120, 60, 140), dtype=np.uint8), (32, 32, 1))
-    board = np.tile(np.array((40, 40, 40), dtype=np.uint8), (32, 32, 1))
-    board[::2, ::2] = 140
+    board = np.tile(np.array((60, 20, 80), dtype=np.uint8), (32, 32, 1))
+    board[::2, ::2] = (160, 60, 180)
     rows = []
     for index, image in enumerate((flat, flat, flat, board, board, board, board)):
         cut = f"{STEM}_cut{index:03d}"
