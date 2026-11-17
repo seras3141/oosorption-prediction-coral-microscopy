@@ -94,10 +94,12 @@ def test_a_quoted_reason_may_contain_a_comma(tmp_path: Path) -> None:
     assert load_cut_exclusions(path).reasons["A_cut000"] == "not annotated, out of focus"
 
 
-def test_the_versioned_csv_leaves_out_the_cut_the_annotators_skipped() -> None:
+def test_the_versioned_csv_excludes_the_two_out_of_focus_cuts() -> None:
     exclusions = load_cut_exclusions(DEFAULT_CUT_EXCLUSIONS)
-    assert exclusions.excluded == {"LHP_SU_9_13-15_cut000"}
+    assert exclusions.excluded == {"LHP_SU_9_13-15_cut000", "LHP_SP_3_25-27_cut002"}
     assert exclusions.reasons["LHP_SU_9_13-15_cut000"] == "not annotated: out of focus"
+    assert (exclusions.reasons["LHP_SP_3_25-27_cut002"]
+            == "out of focus: sharpness 0.03 x the median at 512 px")
     assert not exclusions.known_empty
 
 
@@ -199,7 +201,7 @@ def test_the_training_flag_records_the_csv_or_the_legacy_corpus(tmp_path: Path) 
     legacy = config_from_args(build_parser().parse_args(["--cut-exclusions", "none"]))
     assert legacy.cut_exclusions() == LEGACY_CORPUS
     default = config_from_args(build_parser().parse_args([]))
-    assert default.excluded_cuts == ("LHP_SU_9_13-15_cut000",)
+    assert default.excluded_cuts == tuple(sorted(load_cut_exclusions().excluded))
 
 
 def test_a_fold_manifest_built_with_another_list_is_never_overwritten(tmp_path: Path,
