@@ -7,6 +7,7 @@ import pandas as pd
 from PIL import Image
 from scipy import ndimage
 
+from src.modeling.cut_exclusions import EXCLUDED, CutExclusions
 from src.modeling.tile_index import _resolve_repo_path
 
 QUALITY_TILES_PER_CUT = 60
@@ -16,6 +17,10 @@ MIN_TISSUE_SHARE = 0.05
 EDGE_ERODE_PX = 2
 LUMA = np.array([0.299, 0.587, 0.114], dtype=np.float32)
 STATS = ("brightness", "saturation", "red", "blue", "sharpness")
+DEFAULT_CUTOFF_FRACTION = 0.3
+DEFAULT_MIN_SHARPNESS_TILES = 10
+BLURRED = "blurred"
+TOO_FEW_TILES = "too few tiles"
 
 
 def tile_image_stats(image: np.ndarray) -> dict[str, float] | None:
@@ -67,3 +72,28 @@ def cut_image_quality(tiles: pd.DataFrame, per_cut: int = QUALITY_TILES_PER_CUT,
     for stat in STATS:
         table[f"{stat}_percentile"] = 100 * table[stat].rank(pct=True)
     return table
+
+
+def flag_cuts(quality: pd.DataFrame, exclusions: CutExclusions,
+              cutoff_fraction: float = DEFAULT_CUTOFF_FRACTION,
+              min_sharpness_tiles: int = DEFAULT_MIN_SHARPNESS_TILES) -> pd.DataFrame:
+    """``quality`` with its ``listed`` status in ``exclusions``, each cut's sharpness over the
+    median of the cuts not excluded with at least ``min_sharpness_tiles`` sharpness tiles, and a
+    ``flag``: ``blurred`` below ``cutoff_fraction`` of that median, ``too few tiles`` under the
+    minimum or without a sharpness; least sharp first.
+
+    Raises
+    ------
+    ValueError
+        If no cut can set the median, or it is 0.
+    """
+    listed = quality["cut_name"].map(exclusions.statuses).fillna("")
+    enough = (quality["sharpness_tiles"] >= min_sharpness_tiles) & quality["sharpness"].notna()
+    median = quality.loc[enough & (listed != EXCLUDED), "sharpness"].median()
+    if not median > 0:
+        raise ValueError(f"no reference sharpness: the cuts not excluded with at least "
+                         f"{min_sharpness_tiles} sharpness tiles have median {median}")
+    report = quality.assign(listed=listed, sharpness_vs_median=quality["sharpness"] / median)
+    report["flag"] = np.select([~enough, report["sharpness_vs_median"] < cutoff_fraction],
+                               [TOO_FEW_TILES, BLURRED], "")
+    return report.sort_values(["sharpness", "cut_name"], na_position="first").reset_index(drop=True)

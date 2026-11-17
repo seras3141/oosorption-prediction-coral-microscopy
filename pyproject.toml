@@ -77,6 +77,7 @@ coral-generate-fold-manifest = "scripts.generate_fold_manifest:main"
 coral-run-cross-validation = "scripts.run_cross_validation:main"
 coral-cache-embeddings = "scripts.cache_encoder_embeddings:main"
 coral-plot-cut-maps = "scripts.plot_cut_maps:main"
+coral-report-cut-quality = "scripts.report_cut_quality:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/data_preparation", "src/modeling", "src/qc", "src/visualization", "scripts"]

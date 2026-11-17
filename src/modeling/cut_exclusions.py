@@ -39,13 +39,17 @@ class CutExclusions:
             raise ValueError(f"{', '.join(both)} listed both as excluded and as known empty")
 
     @property
+    def statuses(self) -> dict[str, str]:
+        """Each listed cut's status."""
+        return {**dict.fromkeys(self.excluded, EXCLUDED),
+                **dict.fromkeys(self.known_empty, KNOWN_EMPTY)}
+
+    @property
     def sha256(self) -> str | None:
         """Over the cut names and statuses only; None for the legacy corpus."""
         if not self.applied:
             return None
-        statuses = {**dict.fromkeys(self.excluded, EXCLUDED),
-                    **dict.fromkeys(self.known_empty, KNOWN_EMPTY)}
-        return _listing_sha256(statuses)
+        return _listing_sha256(self.statuses)
 
 
 LEGACY_CORPUS = CutExclusions()

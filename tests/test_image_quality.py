@@ -13,7 +13,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.modeling import tile_index
-from src.qc.image_quality import cut_image_quality, tile_image_stats
+from src.modeling.cut_exclusions import CutExclusions
+from src.qc.image_quality import cut_image_quality, flag_cuts, tile_image_stats
 
 
 def _tile(colour: tuple[int, int, int], size: int = 32) -> np.ndarray:
@@ -131,3 +132,57 @@ def test_thin_tissue_keeps_its_colour_but_has_no_sharpness() -> None:
     stats = tile_image_stats(image)
     assert stats["red"] == pytest.approx(200 / 255)
     assert np.isnan(stats["sharpness"])
+
+
+def _quality(rows: list[tuple[str, float, int]]) -> pd.DataFrame:
+    return pd.DataFrame([{"cut_name": cut, "tiles_measured": 60, "sharpness_tiles": tiles,
+                          "sharpness": sharpness} for cut, sharpness, tiles in rows])
+
+
+def test_a_cut_is_blurred_below_the_cutoff_of_the_median_of_cuts_with_enough_tiles() -> None:
+    quality = _quality([("S_A_1_1-2_cut000", 0.49, 60), ("S_A_1_1-2_cut001", 0.5, 10),
+                        ("S_A_1_1-2_cut002", 1.0, 60), ("S_A_1_1-2_cut003", 1.0, 60),
+                        ("S_A_1_1-2_cut004", 1.0, 60), ("S_A_1_1-2_cut005", 0.01, 9),
+                        ("S_A_1_1-2_cut006", np.nan, 0)])
+    report = flag_cuts(quality, CutExclusions(), cutoff_fraction=0.5, min_sharpness_tiles=10)
+    assert report["cut_name"].tolist() == [f"S_A_1_1-2_cut00{i}" for i in (6, 5, 0, 1, 2, 3, 4)]
+    assert report.set_index("cut_name")["flag"].to_dict() == {
+        "S_A_1_1-2_cut006": "too few tiles", "S_A_1_1-2_cut005": "too few tiles",
+        "S_A_1_1-2_cut000": "blurred", "S_A_1_1-2_cut001": "",
+        "S_A_1_1-2_cut002": "", "S_A_1_1-2_cut003": "", "S_A_1_1-2_cut004": ""}
+    assert report.set_index("cut_name").loc["S_A_1_1-2_cut001", "sharpness_vs_median"] == 0.5
+
+
+def test_each_cut_carries_its_status_in_the_exclusion_list() -> None:
+    quality = _quality([("S_A_1_1-2_cut000", 0.1, 60), ("S_A_1_1-2_cut001", 1.0, 60),
+                        ("S_A_1_1-2_cut002", 1.0, 60)])
+    exclusions = CutExclusions(excluded=frozenset({"S_A_1_1-2_cut000"}),
+                               known_empty=frozenset({"S_A_1_1-2_cut001"}), applied=True)
+    report = flag_cuts(quality, exclusions)
+    assert report.set_index("cut_name")["listed"].to_dict() == {
+        "S_A_1_1-2_cut000": "excluded", "S_A_1_1-2_cut001": "known_empty", "S_A_1_1-2_cut002": ""}
+
+
+def test_excluded_cuts_do_not_set_the_median() -> None:
+    quality = _quality([("S_A_1_1-2_cut000", 0.01, 60), ("S_A_1_1-2_cut001", 0.01, 60),
+                        ("S_A_1_1-2_cut002", 0.45, 60), ("S_A_1_1-2_cut003", 1.0, 60),
+                        ("S_A_1_1-2_cut004", 1.0, 60)])
+    exclusions = CutExclusions(excluded=frozenset({"S_A_1_1-2_cut000", "S_A_1_1-2_cut001"}),
+                               applied=True)
+    report = flag_cuts(quality, exclusions, cutoff_fraction=0.5).set_index("cut_name")
+    assert report.loc["S_A_1_1-2_cut002", "flag"] == "blurred"
+    assert report.loc["S_A_1_1-2_cut003", "sharpness_vs_median"] == 1.0
+
+
+@pytest.mark.parametrize("sharpness, tiles", [(0.0, 60), (1.0, 3)])
+def test_without_a_reference_sharpness_nothing_is_judged(sharpness: float, tiles: int) -> None:
+    quality = _quality([("S_A_1_1-2_cut000", sharpness, tiles),
+                        ("S_A_1_1-2_cut001", sharpness, tiles)])
+    with pytest.raises(ValueError, match="no reference sharpness"):
+        flag_cuts(quality, CutExclusions())
+
+
+def test_a_cut_without_a_sharpness_is_never_judged_sharp() -> None:
+    quality = _quality([("S_A_1_1-2_cut000", np.nan, 0), ("S_A_1_1-2_cut001", 1.0, 60)])
+    report = flag_cuts(quality, CutExclusions(), min_sharpness_tiles=0).set_index("cut_name")
+    assert report.loc["S_A_1_1-2_cut000", "flag"] == "too few tiles"
