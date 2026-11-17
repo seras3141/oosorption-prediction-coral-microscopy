@@ -1,5 +1,6 @@
-"""Cuts the tile index leaves out, read from a versioned CSV: annotators skip cuts they
-cannot read, so an unannotated cut is listed as ``excluded`` or as ``known_empty``."""
+"""Cuts the tile index leaves out, read from a versioned CSV. An out-of-focus cut is
+``excluded`` whether or not it was annotated; annotators skip cuts they cannot read, so an
+unannotated cut is listed as ``excluded`` or as ``known_empty``."""
 
 from __future__ import annotations
 
