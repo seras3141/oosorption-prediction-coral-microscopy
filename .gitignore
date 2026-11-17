@@ -18,7 +18,6 @@ review_sessions/
 data
 data/
 slurm/
-uv.lock
 
 # JupyterLab server state, written into the working tree when a notebook is opened.
 # The ystore holds the real-time-collaboration CRDT history and grows without bound;

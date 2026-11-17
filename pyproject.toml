@@ -17,6 +17,7 @@ dependencies = [
     "pandas>=2.3.3",
     "Pillow>=11.0",
     "scikit-image>=0.25.2",
+    "scipy>=1.17.1",
     "seaborn>=0.13.2",
     "shapely>=2.1.2",
     "tifffile>=2025.10.16",
@@ -78,7 +79,7 @@ coral-cache-embeddings = "scripts.cache_encoder_embeddings:main"
 coral-plot-cut-maps = "scripts.plot_cut_maps:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/data_preparation", "src/modeling", "src/visualization", "scripts"]
+packages = ["src/data_preparation", "src/modeling", "src/qc", "src/visualization", "scripts"]
 
 [tool.pytest.ini_options]
 # Without testpaths, a bare `pytest` recurses from the repo root and stats every file
