@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
+from types import SimpleNamespace
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 import torch
@@ -19,10 +23,17 @@ if str(REPO_ROOT) not in sys.path:
 from src.modeling import held_out_predictions
 from src.modeling.cut_exclusions import LEGACY_CORPUS
 from src.modeling.held_out_predictions import (
+    OUTPUT_COLUMNS,
     check_held_out_coverage,
+    check_reproduces_saved_predictions,
     collect_held_out_tiles,
     load_cv_run,
+    predict_fold,
+    predict_held_out_tiles,
+    run_held_out_predictions,
+    write_held_out_predictions,
 )
+from src.modeling.tile_index import binary_targets
 from src.modeling.train_tile_classifier import TrainingConfig
 
 STEMS = {"CHN_A_1_1-2": 1, "LHP_A_1_1-2": 1, "CHN_A_2_1-2": 2, "LHP_A_2_1-2": 2}
@@ -118,6 +129,7 @@ class CvRunFiles:
             "fold_manifest_sha256": _sha256(self.fold_manifest_path),
             "is_partial": False,
             "folds_missing": [],
+            "cv_run_id": "cv1",
             "n_tiles_held_out": scorable,
             "per_fold": [{"fold": fold, "run_id": self.run_ids[fold],
                           "predictions_path": str(self.predictions_paths[fold])}
@@ -448,3 +460,363 @@ def test_folds_scored_under_different_labellings_are_refused(
 
     with pytest.raises(ValueError, match="scored under different labellings"):
         load_cv_run(run_files.cv_results_path)
+
+
+
+SAVED_PROB = 0.5
+
+
+def _probability_of(tile_id: str) -> float:
+    if tile_id.endswith("_t2"):
+        return 0.9 if tile_id.startswith("CHN") else 0.8
+    return SAVED_PROB
+
+
+class StubModel:
+    def to(self, device):
+        return self
+
+    def eval(self):
+        return self
+
+
+class StubPrediction:
+    """Stands in for model loading and inference, recording what reaches them."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, shift: dict[str, float] | None = None):
+        self.restored_with_cache: list = []
+        self.predicted: list[pd.DataFrame] = []
+        self.predicted_with_cache: list = []
+        self.shift = shift or {}
+        monkeypatch.setattr(held_out_predictions, "_restore_model", self.restore)
+        monkeypatch.setattr(held_out_predictions, "_predict", self.predict)
+
+    def restore(self, config, checkpoint, cache=None):
+        self.restored_with_cache.append(cache)
+        return StubModel()
+
+    def predict(self, model, frame, config, device, num_workers, cache=None):
+        binary_targets(frame)
+        self.predicted.append(frame)
+        self.predicted_with_cache.append(cache)
+        return np.array([_probability_of(t) + self.shift.get(t, 0.0) for t in frame["tile_id"]])
+
+
+def test_every_held_out_tile_is_predicted_and_written(
+    run_files: CvRunFiles, index_calls: list[dict], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    StubPrediction(monkeypatch)
+
+    out_dir = run_held_out_predictions(run_files.cv_results_path, output_root=run_files.root / "out",
+                                       device="cpu")
+
+    predictions = pd.read_csv(out_dir / "predictions.csv")
+    assert tuple(predictions.columns) == OUTPUT_COLUMNS
+    assert len(predictions) == 12
+    assert predictions["is_ambiguous"].sum() == 4
+    assert dict(zip(predictions["tile_id"], predictions["prob"])) == {
+        t: _probability_of(t) for t in predictions["tile_id"]
+    }
+    assert set(zip(predictions["fold"], predictions["run_id"])) == {
+        (fold, run_files.run_ids[fold]) for fold in FOLDS
+    }
+    assert out_dir.name == "cv1"
+    assert [p.name for p in out_dir.parent.iterdir()] == ["cv1"]
+
+
+def test_provenance_records_the_run_its_models_and_the_reproduction_gap(
+    run_files: CvRunFiles, index_calls: list[dict], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    StubPrediction(monkeypatch, shift={"CHN_A_1_1-2_t0": 5e-4})
+
+    out_dir = run_held_out_predictions(run_files.cv_results_path, output_root=run_files.root / "out",
+                                       device="cpu")
+
+    provenance = json.loads((out_dir / "provenance.json").read_text(encoding="utf-8"))
+    assert provenance["cv_results_sha256"] == _sha256(run_files.cv_results_path)
+    assert provenance["fold_manifest_sha256"] == _sha256(run_files.fold_manifest_path)
+    assert (provenance["n_tiles"], provenance["n_ambiguous"]) == (12, 4)
+    folds = {record["fold"]: record for record in provenance["folds"]}
+    assert folds[1]["checkpoint_sha256"] == _sha256(run_files.checkpoint_paths[1])
+    assert folds[1]["max_reproduction_difference"] == pytest.approx(5e-4)
+    assert folds[2]["max_reproduction_difference"] == 0.0
+    assert (folds[1]["n_tiles"], folds[1]["n_ambiguous"]) == (6, 2)
+
+
+def test_ambiguous_tiles_reach_the_model_without_their_label(
+    run_files: CvRunFiles, index_calls: list[dict], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stub = StubPrediction(monkeypatch)
+
+    run_held_out_predictions(run_files.cv_results_path, output_root=run_files.root / "out",
+                             device="cpu")
+
+    assert sum(len(frame) for frame in stub.predicted) == 12
+    assert not any(frame["is_ambiguous"].any() for frame in stub.predicted)
+
+
+def test_probabilities_beyond_the_tolerance_are_refused_and_nothing_is_written(
+    run_files: CvRunFiles, index_calls: list[dict], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    StubPrediction(monkeypatch, shift={"CHN_A_1_1-2_t0": 2e-3})
+
+    with pytest.raises(ValueError, match="differ from the run's saved ones"):
+        run_held_out_predictions(run_files.cv_results_path, output_root=run_files.root / "out",
+                                 device="cpu")
+    assert not (run_files.root / "out").exists() or not any((run_files.root / "out").iterdir())
+
+
+def test_a_saved_tile_left_unpredicted_is_refused(
+    run_files: CvRunFiles, index_calls: list[dict]
+) -> None:
+    cv_run = load_cv_run(run_files.cv_results_path)
+    held_out = collect_held_out_tiles(cv_run)[1]
+    partial = held_out.loc[held_out["tile_id"] != "CHN_A_1_1-2_t0"]
+
+    with pytest.raises(ValueError, match="some saved tiles were not predicted"):
+        check_reproduces_saved_predictions(cv_run.folds[0], partial,
+                                           np.full(len(partial), SAVED_PROB))
+
+
+def test_an_existing_output_is_refused_before_any_prediction(
+    run_files: CvRunFiles, index_calls: list[dict], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stub = StubPrediction(monkeypatch)
+    existing = run_files.root / "out" / "cv1"
+    existing.mkdir(parents=True)
+    (existing / "predictions.csv").write_text("kept", encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        run_held_out_predictions(run_files.cv_results_path, output_root=run_files.root / "out",
+                                 device="cpu")
+    assert stub.predicted == []
+    assert (existing / "predictions.csv").read_text(encoding="utf-8") == "kept"
+
+
+def test_writing_over_an_existing_output_is_refused_without_overwrite(
+    run_files: CvRunFiles, index_calls: list[dict]
+) -> None:
+    cv_run = load_cv_run(run_files.cv_results_path)
+    existing = run_files.root / "out" / "cv1"
+    existing.mkdir(parents=True)
+
+    with pytest.raises(FileExistsError):
+        write_held_out_predictions(cv_run, pd.DataFrame({"is_ambiguous": [False]}), [], "cpu",
+                                   output_root=run_files.root / "out")
+    assert [p.name for p in existing.parent.iterdir()] == ["cv1"]
+
+
+def test_overwrite_replaces_an_existing_output(
+    run_files: CvRunFiles, index_calls: list[dict], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    StubPrediction(monkeypatch)
+    existing = run_files.root / "out" / "cv1"
+    existing.mkdir(parents=True)
+    (existing / "stale.txt").write_text("old", encoding="utf-8")
+
+    out_dir = run_held_out_predictions(run_files.cv_results_path, output_root=run_files.root / "out",
+                                       device="cpu", overwrite=True)
+
+    assert sorted(p.name for p in out_dir.iterdir()) == ["predictions.csv", "provenance.json"]
+
+
+@pytest.mark.parametrize("overwrite, failing", [(False, "rename"), (True, "_swap_into_place")])
+def test_a_failed_write_leaves_no_staging_directory(
+    run_files: CvRunFiles, index_calls: list[dict], monkeypatch: pytest.MonkeyPatch,
+    overwrite: bool, failing: str
+) -> None:
+    def fail(*args):
+        raise OSError("disk full")
+
+    target = held_out_predictions.os if failing == "rename" else held_out_predictions
+    monkeypatch.setattr(target, failing, fail)
+    cv_run = load_cv_run(run_files.cv_results_path)
+
+    with pytest.raises(OSError, match="disk full"):
+        write_held_out_predictions(cv_run, pd.DataFrame({"is_ambiguous": [False]}), [], "cpu",
+                                   output_root=run_files.root / "out", overwrite=overwrite)
+    assert list((run_files.root / "out").iterdir()) == []
+
+
+def test_a_frozen_run_is_scored_from_its_embedding_cache(
+    run_files: CvRunFiles, index_calls: list[dict], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stub = StubPrediction(monkeypatch)
+    cache = object()
+    monkeypatch.setattr(held_out_predictions, "load_config_cache", lambda config: cache)
+    cv_run = load_cv_run(run_files.cv_results_path)
+    frozen = replace(cv_run.folds[0], config=SimpleNamespace(embedding_cache_dir="cache"))
+
+    predict_fold(frozen, collect_held_out_tiles(cv_run)[1], torch.device("cpu"), 0)
+
+    assert stub.restored_with_cache == [cache]
+    assert stub.predicted_with_cache == [cache]
+
+
+def test_tiles_the_run_scored_keep_their_saved_probability(
+    run_files: CvRunFiles, index_calls: list[dict], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    StubPrediction(monkeypatch, shift={"CHN_A_1_1-2_t0": 5e-4, "CHN_A_1_1-2_t2": 5e-4})
+
+    out_dir = run_held_out_predictions(run_files.cv_results_path, output_root=run_files.root / "out",
+                                       device="cpu")
+
+    predictions = pd.read_csv(out_dir / "predictions.csv").set_index("tile_id")
+    assert predictions.loc["CHN_A_1_1-2_t0", "prob"] == SAVED_PROB
+    assert predictions.loc["CHN_A_1_1-2_t0", "prob_source"] == "saved"
+    assert predictions.loc["CHN_A_1_1-2_t2", "prob"] == pytest.approx(0.9 + 5e-4)
+    assert predictions.loc["CHN_A_1_1-2_t2", "prob_source"] == "recomputed"
+    assert (predictions["prob_source"] == "recomputed").sum() == 4
+
+
+def test_a_checkpoint_replaced_after_its_run_was_checked_is_refused(
+    run_files: CvRunFiles, index_calls: list[dict], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stub = StubPrediction(monkeypatch)
+    cv_run = load_cv_run(run_files.cv_results_path)
+    checkpoint = torch.load(run_files.checkpoint_paths[1], weights_only=True)
+    checkpoint["retrained"] = True
+    torch.save(checkpoint, run_files.checkpoint_paths[1])
+
+    with pytest.raises(ValueError, match="has changed since its run was checked"):
+        predict_fold(cv_run.folds[0], collect_held_out_tiles(cv_run)[1], torch.device("cpu"), 0)
+    assert stub.predicted == []
+
+
+def test_a_missing_gpu_is_refused_before_any_work_unless_cpu_is_asked_for(
+    run_files: CvRunFiles, index_calls: list[dict], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stub = StubPrediction(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="no GPU is available"):
+        run_held_out_predictions(run_files.cv_results_path, output_root=run_files.root / "out")
+    assert stub.predicted == [] and index_calls == []
+
+
+def test_a_blank_saved_probability_is_refused(
+    run_files: CvRunFiles, index_calls: list[dict], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    StubPrediction(monkeypatch)
+    saved = pd.read_csv(run_files.predictions_paths[1])
+    saved.loc[saved["tile_id"] == "CHN_A_1_1-2_t0", "prob"] = None
+    saved.to_csv(run_files.predictions_paths[1], index=False)
+
+    with pytest.raises(ValueError, match="saved held-out probabilities are blank"):
+        run_held_out_predictions(run_files.cv_results_path, output_root=run_files.root / "out",
+                                 device="cpu")
+
+
+def test_a_fold_with_no_scored_held_out_tiles_is_refused(
+    run_files: CvRunFiles, index_calls: list[dict]
+) -> None:
+    cv_run = load_cv_run(run_files.cv_results_path)
+    empty = replace(cv_run.folds[0], saved_held_out=cv_run.folds[0].saved_held_out.iloc[:0])
+
+    with pytest.raises(ValueError, match="scored no held-out tiles"):
+        check_reproduces_saved_predictions(empty, collect_held_out_tiles(cv_run)[1], np.array([]))
+
+
+def test_files_changed_after_loading_do_not_reach_the_output_or_its_provenance(
+    run_files: CvRunFiles, index_calls: list[dict], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    StubPrediction(monkeypatch)
+    cv_results_sha256 = _sha256(run_files.cv_results_path)
+    predictions_sha256 = _sha256(run_files.predictions_paths[1])
+    cv_run = load_cv_run(run_files.cv_results_path)
+    held_out = collect_held_out_tiles(cv_run)
+    pd.read_csv(run_files.predictions_paths[1]).assign(prob=0.1).to_csv(
+        run_files.predictions_paths[1], index=False)
+    run_files.edit_json(run_files.cv_results_path, note="rewritten")
+
+    predictions, records = predict_held_out_tiles(cv_run, held_out, torch.device("cpu"), 0)
+    out_dir = write_held_out_predictions(cv_run, predictions, records, "cpu",
+                                         output_root=run_files.root / "out")
+
+    written = pd.read_csv(out_dir / "predictions.csv")
+    assert set(written.loc[written["prob_source"] == "saved", "prob"]) == {SAVED_PROB}
+    provenance = json.loads((out_dir / "provenance.json").read_text(encoding="utf-8"))
+    assert provenance["cv_results_sha256"] == cv_results_sha256
+    assert {f["fold"]: f["saved_predictions_sha256"] for f in provenance["folds"]}[1] == \
+        predictions_sha256
+
+
+def test_the_output_follows_the_umask_and_leaves_other_staging_alone(
+    run_files: CvRunFiles, index_calls: list[dict], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    StubPrediction(monkeypatch)
+    concurrent = run_files.root / "out" / ".cv1.staging-otherjob"
+    concurrent.mkdir(parents=True)
+    (concurrent / "predictions.csv").write_text("in progress", encoding="utf-8")
+    previous = os.umask(0o002)
+    try:
+        out_dir = run_held_out_predictions(run_files.cv_results_path,
+                                           output_root=run_files.root / "out", device="cpu")
+    finally:
+        os.umask(previous)
+
+    assert stat.S_IMODE(out_dir.stat().st_mode) & 0o070 == 0o070
+    assert sorted(p.name for p in out_dir.parent.iterdir()) == [".cv1.staging-otherjob", "cv1"]
+    assert (concurrent / "predictions.csv").read_text(encoding="utf-8") == "in progress"
+
+
+def test_saved_predictions_listing_a_tile_twice_are_refused(
+    run_files: CvRunFiles, index_calls: list[dict]
+) -> None:
+    saved = pd.read_csv(run_files.predictions_paths[1])
+    pd.concat([saved, saved.iloc[:1]]).to_csv(run_files.predictions_paths[1], index=False)
+
+    with pytest.raises(ValueError, match="more than once"):
+        load_cv_run(run_files.cv_results_path)
+
+
+def test_provenance_records_each_folds_evaluation_file_hash(
+    run_files: CvRunFiles, index_calls: list[dict], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    StubPrediction(monkeypatch)
+
+    out_dir = run_held_out_predictions(run_files.cv_results_path, output_root=run_files.root / "out",
+                                       device="cpu")
+
+    provenance = json.loads((out_dir / "provenance.json").read_text(encoding="utf-8"))
+    assert {f["fold"]: f["results_sha256"] for f in provenance["folds"]} == {
+        fold: _sha256(run_files.results_paths[fold]) for fold in FOLDS
+    }
+
+
+def test_a_non_finite_recomputed_probability_is_refused(
+    run_files: CvRunFiles, index_calls: list[dict], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    StubPrediction(monkeypatch, shift={"CHN_A_1_1-2_t2": float("nan")})
+
+    with pytest.raises(ValueError, match="non-finite probabilities"):
+        run_held_out_predictions(run_files.cv_results_path, output_root=run_files.root / "out",
+                                 device="cpu")
+    assert not (run_files.root / "out" / "cv1").exists()
+
+
+def test_an_output_written_concurrently_survives_a_run_without_overwrite(
+    run_files: CvRunFiles, index_calls: list[dict], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cv_run = load_cv_run(run_files.cv_results_path)
+    concurrent = run_files.root / "out" / "cv1"
+    concurrent.mkdir(parents=True)
+    (concurrent / "predictions.csv").write_text("other job", encoding="utf-8")
+    monkeypatch.setattr(held_out_predictions, "_refuse_existing", lambda out_dir, overwrite: None)
+
+    with pytest.raises(OSError):
+        write_held_out_predictions(cv_run, pd.DataFrame({"is_ambiguous": [False]}), [], "cpu",
+                                   output_root=run_files.root / "out")
+    assert (concurrent / "predictions.csv").read_text(encoding="utf-8") == "other job"
+    assert [p.name for p in concurrent.parent.iterdir()] == ["cv1"]
+
+
+@pytest.mark.parametrize("cv_run_id", ["", ".", "..", "../escape", "a/b"])
+def test_a_cv_run_id_that_is_not_a_plain_name_is_refused(
+    run_files: CvRunFiles, index_calls: list[dict], cv_run_id: str
+) -> None:
+    run_files.write_cv_results(cv_run_id=cv_run_id)
+
+    with pytest.raises(ValueError, match="not a plain name"):
+        run_held_out_predictions(run_files.cv_results_path, output_root=run_files.root / "out",
+                                 device="cpu")
