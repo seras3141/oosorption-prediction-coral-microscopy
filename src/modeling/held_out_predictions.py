@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import json
@@ -55,6 +56,7 @@ class FoldRun:
     scoring_area_fraction: float
     n_ambiguous_held_out: int
     checkpoint_sha256: str
+    results_path: Path
     results_sha256: str
     saved_predictions_sha256: str
     saved_held_out: pd.DataFrame = field(compare=False, repr=False)
@@ -258,6 +260,7 @@ def predict_held_out_tiles(cv_run: CvRun, held_out: dict[int, pd.DataFrame],
             "run_id": fold_run.run_id,
             "checkpoint_path": _path_relative_to_repo(fold_run.checkpoint_path),
             "checkpoint_sha256": fold_run.checkpoint_sha256,
+            "results_path": _path_relative_to_repo(fold_run.results_path),
             "results_sha256": fold_run.results_sha256,
             "saved_predictions_path": _path_relative_to_repo(fold_run.saved_predictions_path),
             "saved_predictions_sha256": fold_run.saved_predictions_sha256,
@@ -274,9 +277,21 @@ def predict_held_out_tiles(cv_run: CvRun, held_out: dict[int, pd.DataFrame],
 
 
 def output_dir_for(cv_run: CvRun, output_root: str | Path = DEFAULT_OUTPUT_ROOT) -> Path:
-    cv_run_id = str(cv_run.cv_results.get("cv_run_id", ""))
+    return _output_dir(cv_run.cv_results, cv_run.cv_results_path, output_root)
+
+
+def output_dir_for_results(cv_results_path: str | Path,
+                           output_root: str | Path = DEFAULT_OUTPUT_ROOT) -> Path:
+    """Where a CV run's output goes, read from its cv_results.json alone."""
+    path = _resolve_repo_path(cv_results_path)
+    return _output_dir(json.loads(path.read_text(encoding="utf-8")), path, output_root)
+
+
+def _output_dir(cv_results: dict[str, Any], cv_results_path: Path,
+                output_root: str | Path) -> Path:
+    cv_run_id = str(cv_results.get("cv_run_id", ""))
     if not cv_run_id or Path(cv_run_id).name != cv_run_id or cv_run_id in (".", ".."):
-        raise ValueError(f"{cv_run.cv_results_path} has cv_run_id {cv_run_id!r}, not a plain name")
+        raise ValueError(f"{cv_results_path} has cv_run_id {cv_run_id!r}, not a plain name")
     return _resolve_repo_path(output_root) / cv_run_id
 
 
@@ -314,7 +329,14 @@ def write_held_out_predictions(cv_run: CvRun, predictions: pd.DataFrame,
         else:
             _refuse_existing(out_dir, overwrite)
             # rename refuses a non-empty target directory.
-            os.rename(staging, out_dir)
+            try:
+                os.rename(staging, out_dir)
+            except OSError as exc:
+                if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
+                    raise FileExistsError(
+                        f"{out_dir} came to exist while this run was predicting"
+                    ) from exc
+                raise
     finally:
         if staging.exists():
             shutil.rmtree(staging)
@@ -362,7 +384,9 @@ def _device_details(device: str) -> dict[str, Any]:
 
 def _refuse_existing(out_dir: Path, overwrite: bool) -> None:
     if out_dir.exists() and not overwrite:
-        raise FileExistsError(f"{out_dir} already exists; pass overwrite to replace it")
+        raise FileExistsError(
+            f"{out_dir} already exists; pass overwrite=True (--overwrite) to replace it"
+        )
 
 
 def _load_fold_run(summary: dict[str, Any], fold_manifest: dict[str, Any]) -> FoldRun:
@@ -433,6 +457,7 @@ def _load_fold_run(summary: dict[str, Any], fold_manifest: dict[str, Any]) -> Fo
         scoring_area_fraction=float(scoring_area_fraction),
         n_ambiguous_held_out=int(n_ambiguous_excluded[HELD_OUT_SPLIT]),
         checkpoint_sha256=checkpoint_sha256,
+        results_path=results_path,
         results_sha256=hashlib.sha256(results_bytes).hexdigest(),
         saved_predictions_sha256=hashlib.sha256(saved_bytes).hexdigest(),
         saved_held_out=saved_held_out,

@@ -33,7 +33,7 @@ from src.modeling.held_out_predictions import (
     run_held_out_predictions,
     write_held_out_predictions,
 )
-from src.modeling.tile_index import binary_targets
+from src.modeling.tile_index import _resolve_repo_path, binary_targets
 from src.modeling.train_tile_classifier import TrainingConfig
 
 STEMS = {"CHN_A_1_1-2": 1, "LHP_A_1_1-2": 1, "CHN_A_2_1-2": 2, "LHP_A_2_1-2": 2}
@@ -182,7 +182,8 @@ def test_the_index_uses_the_runs_own_split_labelling_and_corpus(
 ) -> None:
     collect_held_out_tiles(load_cv_run(run_files.cv_results_path))
 
-    assert [Path(call["split_manifest_path"]).resolve() for call in index_calls] == [
+    assert [_resolve_repo_path(call["split_manifest_path"]).resolve()
+            for call in index_calls] == [
         run_files.split_paths[fold].resolve() for fold in FOLDS
     ]
     for call in index_calls:
@@ -782,6 +783,10 @@ def test_provenance_records_each_folds_evaluation_file_hash(
     assert {f["fold"]: f["results_sha256"] for f in provenance["folds"]} == {
         fold: _sha256(run_files.results_paths[fold]) for fold in FOLDS
     }
+    assert {f["fold"]: _resolve_repo_path(f["results_path"]).resolve()
+            for f in provenance["folds"]} == {
+        fold: run_files.results_paths[fold].resolve() for fold in FOLDS
+    }
 
 
 def test_a_non_finite_recomputed_probability_is_refused(
@@ -804,7 +809,7 @@ def test_an_output_written_concurrently_survives_a_run_without_overwrite(
     (concurrent / "predictions.csv").write_text("other job", encoding="utf-8")
     monkeypatch.setattr(held_out_predictions, "_refuse_existing", lambda out_dir, overwrite: None)
 
-    with pytest.raises(OSError):
+    with pytest.raises(FileExistsError, match="came to exist while this run was predicting"):
         write_held_out_predictions(cv_run, pd.DataFrame({"is_ambiguous": [False]}), [], "cpu",
                                    output_root=run_files.root / "out")
     assert (concurrent / "predictions.csv").read_text(encoding="utf-8") == "other job"
