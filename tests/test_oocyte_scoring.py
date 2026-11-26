@@ -7,6 +7,7 @@ import math
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -16,10 +17,20 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.modeling.oocyte_scoring import (
     CellGrid,
+    CutGeometry,
     cell_grid,
     cut_geometry,
+    false_blob_counts,
+    fold_curve,
+    found_thresholds,
     load_oocytes,
     oocyte_coverage,
+    operating_point,
+    per_oocyte_table,
+    recall_by,
+    size_bin_edges,
+    summarise_operating_points,
+    threshold_grid,
     tile_stride,
 )
 from src.modeling.tile_labels import load_annotation_features, load_annotation_polygons
@@ -299,3 +310,248 @@ def test_coverage_is_numeric_when_no_oocyte_has_a_scored_cell(tmp_path: Path) ->
 
     assert coverage.dtype == "float64" and coverage.isna().all()
     assert geometry.overlaps["area"].dtype == "float64"
+
+
+
+SCENARIO = {"t_r1_c1": 0.9, "t_r0_c0": 0.8, "t_r0_c1": 0.3, "t_r1_c0": 0.2,
+            "t_r0_c3": 0.7, "t_r1_c3": 0.7}
+SCORED_PX = WIDTH * HEIGHT - 5 * 3
+UM2_PER_PX = 0.25
+
+
+def _scenario(geometry) -> pd.Series:
+    return pd.Series({tile: SCENARIO.get(tile, 0.1) for tile in geometry.cells["tile_id"]})
+
+
+def test_found_threshold_is_the_probability_where_coverage_reaches_half(geometry) -> None:
+    found = found_thresholds(geometry, _scenario(geometry))
+
+    assert found[0] == 0.9
+    assert found[1] == 0.8
+    assert math.isnan(found[2])
+
+
+def test_coverage_of_exactly_half_counts_as_found(geometry) -> None:
+    probabilities = _scenario(geometry)
+    probabilities["t_r0_c0"] = 0.85
+
+    assert oocyte_coverage(geometry, probabilities, threshold=0.85)[1] == 0.5
+    assert found_thresholds(geometry, probabilities)[1] == 0.85
+
+
+def test_found_threshold_refuses_a_cell_under_an_oocyte_without_a_probability(geometry) -> None:
+    with pytest.raises(ValueError, match="have no probability"):
+        found_thresholds(geometry, _scenario(geometry).drop("t_r0_c1"))
+
+
+def test_per_oocyte_table_carries_fold_stage_size_and_found_threshold(geometry) -> None:
+    table = per_oocyte_table(geometry, _scenario(geometry), fold=3)
+
+    assert list(table["fold"]) == [3, 3, 3]
+    assert list(table["found_threshold"].fillna(-1)) == [0.9, 0.8, -1]
+    assert "polygon" not in table
+
+
+def test_false_blobs_are_connected_positive_groups_touching_no_annotation(geometry) -> None:
+    counts = false_blob_counts(geometry, _scenario(geometry), np.array([0.95, 0.75, 0.65, 0.05]))
+
+    assert list(counts) == [0, 0, 1, 0]
+
+
+def test_fold_curve_gives_recall_false_blob_density_and_spill(geometry) -> None:
+    probabilities = _scenario(geometry)
+    oocytes = per_oocyte_table(geometry, probabilities, fold=1)
+
+    curve = fold_curve([geometry], probabilities, oocytes, np.array([0.65, 0.75, 0.85]))
+
+    assert list(curve["n_scorable"]) == [2, 2, 2]
+    assert list(curve["recall"]) == [1.0, 1.0, 0.5]
+    assert list(curve["false_blobs"]) == [1, 0, 0]
+    assert curve.loc[0, "false_blobs_per_cm2"] == pytest.approx(1 / (SCORED_PX * UM2_PER_PX / 1e8))
+    positive_px = {0.65: 81 + 64 + 45 + 40, 0.75: 81 + 64}
+    annotation_px = 4 + 19
+    for row, threshold in enumerate((0.65, 0.75)):
+        assert curve.loc[row, "positive_um2"] == pytest.approx(positive_px[threshold] * UM2_PER_PX)
+        assert curve.loc[row, "spill"] == pytest.approx(
+            (positive_px[threshold] - annotation_px) / positive_px[threshold])
+
+
+def test_spill_is_undefined_when_no_cell_is_positive(geometry) -> None:
+    probabilities = _scenario(geometry)
+    oocytes = per_oocyte_table(geometry, probabilities, fold=1)
+
+    curve = fold_curve([geometry], probabilities, oocytes, np.array([1.0]))
+
+    assert math.isnan(curve.loc[0, "spill"]) and curve.loc[0, "positive_um2"] == 0
+
+
+def test_operating_point_takes_the_largest_threshold_reaching_the_recall(geometry) -> None:
+    probabilities = _scenario(geometry)
+    curve = fold_curve([geometry], probabilities, per_oocyte_table(geometry, probabilities, 1),
+                       np.array([0.65, 0.75, 0.85]))
+
+    point = operating_point(curve, 0.8)
+
+    assert point["threshold"] == 0.75 and point["recall"] == 1.0
+    assert point["false_blobs_per_cm2"] == 0
+    assert point["spill"] == pytest.approx((145 - 23) / 145)
+    assert operating_point(curve, 0.5)["threshold"] == 0.85
+    assert operating_point(curve, 1.01) is None
+
+
+def test_summary_names_folds_that_never_reach_a_target_and_leaves_them_out() -> None:
+    curves = {
+        1: pd.DataFrame({"threshold": [0.2, 0.6], "recall": [0.95, 0.85], "n_scorable": [5, 5],
+                         "false_blobs_per_cm2": [4.0, 2.0], "spill": [0.5, 0.3]}),
+        2: pd.DataFrame({"threshold": [0.2, 0.6], "recall": [0.82, 0.7], "n_scorable": [5, 5],
+                         "false_blobs_per_cm2": [6.0, 3.0], "spill": [0.6, 0.4]}),
+        3: pd.DataFrame({"threshold": [0.2, 0.6], "recall": [np.nan, np.nan], "n_scorable": [0, 0],
+                         "false_blobs_per_cm2": [1.0, 1.0], "spill": [0.1, 0.1]}),
+    }
+
+    summary = summarise_operating_points(curves, targets=(0.8, 0.9))
+
+    assert summary["recall_0.80"]["false_blobs_per_cm2"] == {"mean": 4.0, "min": 2.0, "max": 6.0}
+    assert summary["recall_0.80"]["folds_not_reaching"] == []
+    assert summary["recall_0.90"]["folds_not_reaching"] == [2]
+    assert summary["recall_0.90"]["spill"] == {"mean": 0.5, "min": 0.5, "max": 0.5}
+    assert summary["recall_0.80"]["folds_without_judged_oocytes"] == [3]
+
+
+def test_the_threshold_grid_is_ascending_logit_spaced_and_closed() -> None:
+    grid = threshold_grid(n=5, low=0.01)
+
+    assert grid[0] == 0.0 and grid[-1] == 1.0 and len(grid) == 7
+    assert np.all(np.diff(grid) > 0)
+    logits = np.log(grid[1:-1] / (1 - grid[1:-1]))
+    assert np.allclose(np.diff(logits), np.diff(logits)[0])
+    assert grid[1] == pytest.approx(0.01) and grid[-2] == pytest.approx(0.99)
+
+
+def test_size_bins_are_quartiles_open_at_both_ends() -> None:
+    edges = size_bin_edges(pd.Series([10.0, 20.0, 30.0, 40.0, 50.0, np.nan]))
+
+    assert edges == [-math.inf, 20.0, 30.0, 40.0, math.inf]
+
+
+def test_recall_by_judges_each_oocyte_at_its_folds_threshold() -> None:
+    oocytes = pd.DataFrame({"fold": [1, 1, 2, 2, 3], "stage": [0, 4, 0, 0, 0],
+                            "found_threshold": [0.5, 0.2, 0.7, np.nan, 0.9]})
+
+    table = recall_by(oocytes, {1: 0.4, 2: 0.8}, "stage")
+
+    assert table.loc[0].to_dict() == {"n_scorable": 2, "n_found": 1, "recall": 0.5}
+    assert table.loc[4].to_dict() == {"n_scorable": 1, "n_found": 0, "recall": 0.0}
+
+
+
+def test_coverage_between_forty_and_fifty_percent_is_not_found(tmp_path: Path) -> None:
+    manifest = _manifest()
+    scored = {tile["tile_id"] for tile in manifest["tiles"]}
+    geometry = cut_geometry(manifest, _geojson(tmp_path, {"Oosorption Stage 0": _square(5, 10, 14, 14)}),
+                            TILE, scored)
+    probabilities = pd.Series({tile: 0.1 for tile in scored})
+    probabilities["t_r1_c0"] = 0.9
+
+    assert oocyte_coverage(geometry, probabilities, threshold=0.9)[0] == pytest.approx(16 / 36)
+    assert found_thresholds(geometry, probabilities)[0] == 0.1
+
+
+def test_exactly_half_survives_floating_point_rounding() -> None:
+    overlaps = pd.DataFrame({"tile_id": ["a", "b", "c"], "oocyte": [0, 0, 0],
+                             "area": [0.3, 0.2, 0.1]})
+    geometry = CutGeometry(
+        cut_name="c", tile_size=TILE, um2_per_px=1.0,
+        cells=pd.DataFrame(columns=["tile_id", "row", "col", "area", "annotation_area"]),
+        oocytes=pd.DataFrame({"oocyte": [0], "area": [0.6], "scorable_area": [0.1 + 0.2 + 0.3]}),
+        overlaps=overlaps)
+
+    assert 0.3 < 0.5 * (0.1 + 0.2 + 0.3)
+    assert found_thresholds(geometry, pd.Series({"a": 0.9, "b": 0.5, "c": 0.2}))[0] == 0.9
+
+
+def test_a_threshold_equal_to_a_probability_counts_that_cell_and_oocyte(geometry) -> None:
+    probabilities = _scenario(geometry)
+    oocytes = per_oocyte_table(geometry, probabilities, fold=1)
+
+    curve = fold_curve([geometry], probabilities, oocytes, np.array([0.8]))
+
+    assert curve.loc[0, "recall"] == 1.0
+    assert curve.loc[0, "positive_um2"] == pytest.approx((81 + 64) * UM2_PER_PX)
+
+
+def test_cells_meeting_only_at_a_corner_are_separate_blobs(geometry) -> None:
+    probabilities = pd.Series({tile: 0.1 for tile in geometry.cells["tile_id"]})
+    probabilities[["t_r0_c3", "t_r1_c2"]] = 0.7
+
+    assert list(false_blob_counts(geometry, probabilities, np.array([0.5]))) == [2]
+
+
+
+def test_size_bins_merge_tied_quartiles_and_refuse_no_diameters() -> None:
+    assert size_bin_edges(pd.Series([10.0, 10.0, 10.0, 10.0, 50.0])) == [-math.inf, 10.0, math.inf]
+    with pytest.raises(ValueError, match="no oocyte diameters"):
+        size_bin_edges(pd.Series([np.nan]))
+
+
+def test_recall_by_keeps_oocytes_without_a_stage_and_empty_bins() -> None:
+    oocytes = pd.DataFrame({"fold": [1, 1, 1], "stage": pd.array([0, None, None], dtype="Int64"),
+                            "found_threshold": [0.5, 0.6, 0.1]})
+    oocytes["size_bin"] = pd.Categorical(["small", "small", "small"], categories=["small", "large"])
+
+    by_stage = recall_by(oocytes, {1: 0.4}, "stage")
+    by_size = recall_by(oocytes, {1: 0.4}, "size_bin")
+
+    assert by_stage["n_scorable"].sum() == 3
+    assert by_stage.loc[by_stage.index.isna(), "n_found"].item() == 1
+    assert by_size.loc["large", "n_scorable"] == 0
+
+
+def test_fold_curve_refuses_oocytes_from_cuts_it_was_not_given(geometry) -> None:
+    probabilities = _scenario(geometry)
+    oocytes = per_oocyte_table(geometry, probabilities, fold=1)
+    other = oocytes.assign(cut_name="S_B_2_1-2_cut000")
+
+    with pytest.raises(ValueError, match="not among the geometries"):
+        fold_curve([geometry], probabilities, pd.concat([oocytes, other]), np.array([0.5]))
+
+
+def test_fold_curve_refuses_a_scored_cell_without_a_probability(geometry) -> None:
+    probabilities = _scenario(geometry)
+    oocytes = per_oocyte_table(geometry, probabilities, fold=1)
+
+    with pytest.raises(ValueError, match="scored cells have no probability"):
+        fold_curve([geometry], probabilities.drop("t_r2_c2"), oocytes, np.array([0.5]))
+
+
+
+@pytest.mark.parametrize("x0, share, scorable", [(22, 9 / 24, False), (20, 0.5, True)])
+def test_an_oocyte_needs_half_its_area_in_scored_cells_to_be_judged(
+    tmp_path: Path, x0: int, share: float, scorable: bool
+) -> None:
+    manifest = _manifest()
+    tiles = {tile["tile_id"] for tile in manifest["tiles"]}
+    geometry = cut_geometry(manifest, _geojson(tmp_path, {"Oosorption Stage 0": _square(x0, 17, 30, 20)}),
+                            TILE, tiles)
+    probabilities = pd.Series({tile: 0.9 for tile in tiles})
+
+    table = per_oocyte_table(geometry, probabilities, fold=1)
+
+    assert table.loc[0, "scorable_share"] == pytest.approx(share)
+    assert math.isnan(table.loc[0, "found_threshold"]) != scorable
+
+
+
+def test_fold_curve_refuses_a_cut_with_oocytes_missing_from_the_table(tmp_path: Path, geometry) -> None:
+    probabilities = _scenario(geometry)
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    manifest = _manifest()
+    manifest["cut_name"] = "S_A_1_1-2_cut001"
+    other = cut_geometry(manifest, _geojson(other_dir, OOCYTES).rename(
+        other_dir / "S_A_1_1-2_cut001_annotations.geojson"), TILE,
+        {tile["tile_id"] for tile in manifest["tiles"]})
+
+    with pytest.raises(ValueError, match="no rows in the per-oocyte table"):
+        fold_curve([geometry, other], probabilities, per_oocyte_table(geometry, probabilities, 1),
+                   np.array([0.5]))
