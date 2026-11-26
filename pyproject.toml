@@ -79,6 +79,7 @@ coral-cache-embeddings = "scripts.cache_encoder_embeddings:main"
 coral-plot-cut-maps = "scripts.plot_cut_maps:main"
 coral-report-cut-quality = "scripts.report_cut_quality:main"
 coral-predict-held-out-tiles = "scripts.predict_held_out_tiles:main"
+coral-score-oocytes = "scripts.score_oocytes:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/data_preparation", "src/modeling", "src/qc", "src/visualization", "scripts"]

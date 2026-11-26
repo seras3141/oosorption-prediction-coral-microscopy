@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import src.modeling.embedding_cache as embedding_cache
+import src.modeling.output_dirs as output_dirs
 import src.modeling.encoders as encoders
 from src.modeling.embedding_cache import (
     CachedEmbeddingDataset,
@@ -298,14 +299,14 @@ def test_a_failed_swap_keeps_the_previous_cache(
             raise OSError("simulated failure")
         real_replace(src, dst)
 
-    monkeypatch.setattr(embedding_cache.os, "replace", failing_replace)
+    monkeypatch.setattr(output_dirs.os, "replace", failing_replace)
     with pytest.raises(OSError, match="simulated"):
         build_cache(ENCODER, 512, path.parent.parent, batch_size=4, num_workers=0,
                     tiles=tiles.head(3), device="cpu")
     assert (path / "meta.json").read_text() == original
     assert load_cache(path, 512, ENCODER).meta["n_tiles"] == 6
 
-    monkeypatch.setattr(embedding_cache.os, "replace", real_replace)
+    monkeypatch.setattr(output_dirs.os, "replace", real_replace)
     build_cache(ENCODER, 512, path.parent.parent, batch_size=4, num_workers=0,
                 tiles=tiles.head(3), device="cpu")
     assert load_cache(path, 512, ENCODER).meta["n_tiles"] == 3

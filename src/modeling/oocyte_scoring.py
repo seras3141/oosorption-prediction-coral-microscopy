@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
+import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,12 +18,18 @@ from shapely.ops import unary_union
 from shapely.strtree import STRtree
 
 from src.data_preparation.annotations import extract_stage
+from src.modeling.cross_validation import _path_relative_to_repo
+from src.modeling.cut_exclusions import CutExclusions, cut_exclusion_fields
+from src.modeling.output_dirs import publish_directory
+from src.modeling.tile_index import DEFAULT_CUTS_DIR, DEFAULT_TILES_DIR, _resolve_repo_path
 from src.modeling.tile_labels import load_annotation_features
 
 FOUND_COVERAGE = 0.5
 MIN_SCORABLE_SHARE = 0.5
 OPERATING_RECALLS = (0.80, 0.90)
 UM2_PER_CM2 = 1e8
+DEFAULT_OUTPUT_ROOT = "data/tile_classifier_cv/oocyte_scores"
+NOISE_FLOOR_METRICS = ("false_blobs_per_cm2", "spill", "threshold")
 # Areas summed in a different order differ by rounding.
 COVERAGE_RTOL = 1e-9
 
@@ -357,4 +366,232 @@ def recall_by(oocytes: pd.DataFrame, fold_thresholds: dict[int, float], column: 
     grouped = found.groupby(judged[column], observed=False, dropna=False)
     return pd.DataFrame({"n_scorable": grouped.size(), "n_found": grouped.sum(),
                          "recall": grouped.mean()})
+
+
+@dataclass(frozen=True)
+class ScoredRun:
+    """A CV run's per-oocyte table, per-fold curves and summary."""
+
+    per_oocyte: pd.DataFrame = field(repr=False)
+    curves: pd.DataFrame = field(repr=False)
+    summary: dict[str, Any] = field(repr=False)
+
+
+def score_held_out_predictions(held_out_dir: str | Path, cut_exclusions: CutExclusions,
+                               tiles_dir: str | Path = DEFAULT_TILES_DIR,
+                               cuts_dir: str | Path = DEFAULT_CUTS_DIR) -> ScoredRun:
+    """Score one CV run per oocyte; excluded cuts are left out entirely."""
+    run_dir = _resolve_repo_path(held_out_dir)
+    if not cut_exclusions.applied:
+        raise ValueError(
+            "per-oocyte scoring needs an applied cut exclusion list: without one, cuts left "
+            "unannotated would count their oocytes as false blobs and spill"
+        )
+    provenance_bytes = (run_dir / "provenance.json").read_bytes()
+    predictions_bytes = (run_dir / "predictions.csv").read_bytes()
+    provenance = json.loads(provenance_bytes.decode("utf-8"))
+    predictions = pd.read_csv(io.BytesIO(predictions_bytes))
+    if predictions.empty:
+        raise ValueError(f"{run_dir}: predictions.csv has no rows")
+    _check_matches_provenance(run_dir, predictions, provenance)
+    tile_size = int(predictions["tile_size"].iloc[0])
+
+    cut_folds = predictions.groupby("cut_name")["fold"].nunique()
+    if (cut_folds > 1).any():
+        raise ValueError(f"{run_dir}: cuts scored by more than one fold: "
+                         f"{sorted(cut_folds.index[cut_folds > 1])}")
+    excluded = sorted(set(predictions["cut_name"]) & cut_exclusions.excluded)
+    scored = predictions.loc[~predictions["cut_name"].isin(cut_exclusions.excluded)]
+    if scored.empty:
+        raise ValueError(f"{run_dir}: every cut in the predictions is excluded; nothing to score")
+    probabilities = scored.set_index("tile_id")["prob"]
+
+    grid = threshold_grid()
+    tables, curves = [], {}
+    for fold, fold_tiles in scored.groupby("fold"):
+        geometries, fold_tables = [], []
+        for (stem, cut_name), cut_tiles in fold_tiles.groupby(["stem", "cut_name"]):
+            manifest_path = (_resolve_repo_path(tiles_dir) / stem / cut_name
+                             / f"{cut_name}_tile_manifest.json")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            geojson = _resolve_repo_path(cuts_dir) / stem / f"{cut_name}_annotations.geojson"
+            geometry = cut_geometry(manifest, geojson, tile_size, set(cut_tiles["tile_id"]))
+            if geometry.oocytes.empty and cut_name not in cut_exclusions.known_empty:
+                raise ValueError(
+                    f"{cut_name} has no annotations but is not listed as known empty; an "
+                    "unannotated cut is not an empty one"
+                )
+            if not geometry.oocytes.empty and cut_name in cut_exclusions.known_empty:
+                raise ValueError(f"{cut_name} is listed as known empty but has annotations")
+            geometries.append(geometry)
+            fold_tables.append(per_oocyte_table(geometry, probabilities, int(fold)))
+        table = pd.concat(fold_tables, ignore_index=True)
+        tables.append(table)
+        curves[int(fold)] = fold_curve(geometries, probabilities, table, grid)
+
+    per_oocyte = pd.concat(tables, ignore_index=True)
+    if per_oocyte.empty:
+        raise ValueError(f"{run_dir}: the scored cuts hold no oocytes")
+    edges = size_bin_edges(per_oocyte["equivalent_diameter_um"])
+    per_oocyte = per_oocyte.assign(size_bin=pd.cut(per_oocyte["equivalent_diameter_um"], edges,
+                                                   labels=False, right=False).astype("int64"))
+    operating = summarise_operating_points(curves)
+    summary = {
+        "cv_run_id": provenance["cv_run_id"],
+        "tile_size": tile_size,
+        "held_out_predictions": _path_relative_to_repo(run_dir),
+        "predictions_sha256": hashlib.sha256(predictions_bytes).hexdigest(),
+        "provenance_sha256": hashlib.sha256(provenance_bytes).hexdigest(),
+        "fold_manifest_sha256": provenance["fold_manifest_sha256"],
+        "excluded_cuts_in_predictions": excluded,
+        "cut_exclusions": {key: list(value) if isinstance(value, tuple) else value
+                           for key, value in cut_exclusion_fields(cut_exclusions).items()},
+        "found_coverage": FOUND_COVERAGE,
+        "min_scorable_share": MIN_SCORABLE_SHARE,
+        "size_bin_edges_um": edges[1:-1],
+        "oocytes": _oocyte_counts(per_oocyte),
+        "operating_points": operating,
+        "breakdowns": _breakdowns(per_oocyte, operating),
+    }
+    curve_table = pd.concat([curve.assign(fold=fold) for fold, curve in curves.items()],
+                            ignore_index=True)
+    return ScoredRun(per_oocyte=per_oocyte, curves=curve_table, summary=summary)
+
+
+def write_oocyte_scores(scored: ScoredRun, output_root: str | Path = DEFAULT_OUTPUT_ROOT,
+                        overwrite: bool = False) -> Path:
+    """Write ``per_oocyte.csv``, ``curves.csv`` and ``summary.json`` for one CV run."""
+    def write(staging: Path) -> None:
+        scored.per_oocyte.to_csv(staging / "per_oocyte.csv", index=False)
+        scored.curves.to_csv(staging / "curves.csv", index=False)
+        _write_json(staging / "summary.json", scored.summary)
+
+    out_dir = output_dir_for_name(output_root, scored.summary["cv_run_id"])
+    return publish_directory(out_dir, write, overwrite)
+
+
+def noise_floor(summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Across runs of one tile size and fold manifest, the range of each fold-mean metric."""
+    if len(summaries) < 2:
+        raise ValueError("a noise floor needs at least two runs")
+    for key in ("tile_size", "fold_manifest_sha256", "cut_exclusions", "found_coverage",
+                "min_scorable_share", "size_bin_edges_um", "operating_points",
+                "excluded_cuts_in_predictions", "oocytes"):
+        values = {json.dumps(sorted(summary[key]) if key == "operating_points" else summary[key])
+                  for summary in summaries}
+        if len(values) > 1:
+            raise ValueError(f"the runs disagree on {key}: {sorted(values)}")
+    run_ids = [summary["cv_run_id"] for summary in summaries]
+    if len(set(run_ids)) < len(run_ids):
+        raise ValueError(f"a run appears more than once: {run_ids}")
+
+    floor: dict[str, Any] = {
+        "tile_size": summaries[0]["tile_size"], "runs": run_ids,
+        "fold_manifest_sha256": summaries[0]["fold_manifest_sha256"],
+        "cut_exclusions": summaries[0]["cut_exclusions"],
+        "inputs": {summary["cv_run_id"]: {key: summary[key] for key in
+                                         ("predictions_sha256", "provenance_sha256")}
+                   for summary in summaries},
+    }
+    for target in summaries[0]["operating_points"]:
+        folds = {summary["cv_run_id"]: sorted(int(fold) for fold in
+                                             summary["operating_points"][target]["per_fold"])
+                 for summary in summaries}
+        shared = sorted(set.intersection(*(set(f) for f in folds.values())))
+        floor[target] = {"folds_per_run": folds, "folds_used": shared,
+                         "fold_sets_match": len({json.dumps(f) for f in folds.values()}) == 1}
+        for metric in NOISE_FLOOR_METRICS:
+            per_run = {summary["cv_run_id"]: _mean_over_folds(summary, target, metric, shared)
+                       for summary in summaries}
+            missing = sorted(run for run, value in per_run.items() if value is None)
+            values = [value for value in per_run.values() if value is not None]
+            floor[target][metric] = {
+                "per_run": per_run,
+                "runs_without_value": missing,
+                "min": min(values) if values else None,
+                "max": max(values) if values else None,
+                "range": (max(values) - min(values)) if values else None,
+            }
+    return floor
+
+
+def _mean_over_folds(summary: dict[str, Any], target: str, metric: str,
+                     folds: list[int]) -> float | None:
+    per_fold = {int(fold): values for fold, values in
+                summary["operating_points"][target]["per_fold"].items()}
+    return float(np.mean([per_fold[fold][metric] for fold in folds])) if folds else None
+
+
+def write_noise_floor(floor: dict[str, Any], output_root: str | Path = DEFAULT_OUTPUT_ROOT,
+                      overwrite: bool = False) -> Path:
+    runs = hashlib.sha256(",".join(sorted(floor["runs"])).encode()).hexdigest()[:8]
+    name = f"noise_floor_{floor['tile_size']:04d}_{floor['fold_manifest_sha256'][:8]}_{runs}"
+    return publish_directory(output_dir_for_name(output_root, name),
+                             lambda staging: _write_json(staging / "noise_floor.json", floor),
+                             overwrite)
+
+
+def _check_matches_provenance(run_dir: Path, predictions: pd.DataFrame,
+                              provenance: dict[str, Any]) -> None:
+    counts = {"n_tiles": int(len(predictions)), "n_ambiguous": int(predictions["is_ambiguous"].sum())}
+    for key, value in counts.items():
+        if provenance.get(key) != value:
+            raise ValueError(f"{run_dir}: predictions.csv has {key}={value}, but provenance.json "
+                             f"records {provenance.get(key)}")
+    duplicated = predictions.loc[predictions["tile_id"].duplicated(), "tile_id"]
+    if len(duplicated):
+        raise ValueError(f"{run_dir}: predictions.csv lists {duplicated.nunique()} tile(s) more "
+                         f"than once, e.g. {sorted(duplicated)[:3]}")
+    sizes = sorted(predictions["tile_size"].unique())
+    if len(sizes) != 1:
+        raise ValueError(f"{run_dir}: predictions.csv mixes tile sizes {sizes}")
+
+
+def _oocyte_counts(per_oocyte: pd.DataFrame) -> dict[str, int]:
+    return {
+        "total": int(len(per_oocyte)),
+        "judged": int(per_oocyte["found_threshold"].notna().sum()),
+        "no_scored_area": int((per_oocyte["scorable_area"] == 0).sum()),
+        "under_min_share": int(((per_oocyte["scorable_area"] > 0)
+                                & per_oocyte["found_threshold"].isna()).sum()),
+    }
+
+
+def _breakdowns(per_oocyte: pd.DataFrame, operating: dict[str, Any]) -> dict[str, Any]:
+    breakdowns = {}
+    for target, point in operating.items():
+        thresholds = {fold: values["threshold"] for fold, values in point["per_fold"].items()}
+        breakdowns[target] = {
+            "folds": sorted(int(fold) for fold in thresholds),
+            **{column: _records(recall_by(per_oocyte, thresholds, column))
+               for column in ("size_bin", "stage")},
+        }
+    return breakdowns
+
+
+def _records(table: pd.DataFrame) -> list[dict[str, Any]]:
+    return [{"value": None if pd.isna(value) else int(value), "n_scorable": int(row.n_scorable),
+             "n_found": int(row.n_found),
+             "recall": None if pd.isna(row.recall) else float(row.recall)}
+            for value, row in zip(table.index, table.itertuples())]
+
+
+def output_dir_for_name(output_root: str | Path, name: str) -> Path:
+    """``output_root / name``, refusing a name that is not one plain directory."""
+    if not name or Path(name).name != name or name in (".", ".."):
+        raise ValueError(f"{name!r} is not a plain directory name")
+    return _resolve_repo_path(output_root) / name
+
+
+def _write_json(path: Path, data: dict[str, Any]) -> None:
+    path.write_text(json.dumps(data, indent=2, allow_nan=False, default=_jsonable) + "\n",
+                    encoding="utf-8")
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    raise TypeError(f"{type(value).__name__} is not JSON serialisable")
 

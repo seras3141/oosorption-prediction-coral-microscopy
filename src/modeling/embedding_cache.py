@@ -6,7 +6,6 @@ import csv
 import hashlib
 import json
 import logging
-import os
 import shutil
 from dataclasses import dataclass
 from datetime import date
@@ -17,6 +16,7 @@ import numpy as np
 import pandas as pd
 import torch
 
+from src.modeling.output_dirs import swap_into_place
 from src.modeling.tile_classification_dataset import TileClassificationDataset
 from src.modeling.tile_index import LABEL_RULE_CENTROID, _resolve_repo_path, load_tile_index
 
@@ -84,23 +84,6 @@ def tile_manifest_sha256(relative_paths: list[str]) -> dict[str, str]:
     return {
         relative: file_sha256(_resolve_repo_path(relative)) for relative in sorted(relative_paths)
     }
-
-
-def _swap_into_place(staging: Path, out_dir: Path) -> None:
-    """Replace ``out_dir`` with ``staging``, restoring the old cache if the move fails."""
-    previous = out_dir.with_name(out_dir.name + ".previous")
-    if out_dir.exists():
-        if previous.exists():
-            shutil.rmtree(previous)
-        os.replace(out_dir, previous)
-    try:
-        os.replace(staging, out_dir)
-    except OSError:
-        if previous.exists():
-            os.replace(previous, out_dir)
-        raise
-    if previous.exists():
-        shutil.rmtree(previous)
 
 
 def local_encoder_revision(encoder_name: str) -> str | None:
@@ -204,7 +187,7 @@ def build_cache(
         raise ValueError(
             f"tile manifests changed while the cache was built; {out_dir} was left as it was"
         )
-    _swap_into_place(staging, out_dir)
+    swap_into_place(staging, out_dir)
     LOG.info("Wrote %s (%d tiles x %d x %d)", out_dir, len(frame), n_sub, model.embedding_dim)
     return out_dir
 
