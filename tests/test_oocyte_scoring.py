@@ -353,9 +353,11 @@ def test_per_oocyte_table_carries_fold_stage_size_and_found_threshold(geometry) 
 
 
 def test_false_blobs_are_connected_positive_groups_touching_no_annotation(geometry) -> None:
-    counts = false_blob_counts(geometry, _scenario(geometry), np.array([0.95, 0.75, 0.65, 0.05]))
+    counts, multi_cell = false_blob_counts(geometry, _scenario(geometry),
+                                           np.array([0.95, 0.75, 0.65, 0.05]))
 
     assert list(counts) == [0, 0, 1, 0]
+    assert list(multi_cell) == [0, 0, 1, 0]
 
 
 def test_fold_curve_gives_recall_false_blob_density_and_spill(geometry) -> None:
@@ -367,6 +369,8 @@ def test_fold_curve_gives_recall_false_blob_density_and_spill(geometry) -> None:
     assert list(curve["n_scorable"]) == [2, 2, 2]
     assert list(curve["recall"]) == [1.0, 1.0, 0.5]
     assert list(curve["false_blobs"]) == [1, 0, 0]
+    assert list(curve["false_blobs_2plus"]) == [1, 0, 0]
+    assert curve.loc[0, "false_blobs_2plus_per_cm2"] == curve.loc[0, "false_blobs_per_cm2"]
     assert curve.loc[0, "false_blobs_per_cm2"] == pytest.approx(1 / (SCORED_PX * UM2_PER_PX / 1e8))
     positive_px = {0.65: 81 + 64 + 45 + 40, 0.75: 81 + 64}
     annotation_px = 4 + 19
@@ -393,7 +397,7 @@ def test_operating_point_takes_the_largest_threshold_reaching_the_recall(geometr
     point = operating_point(curve, 0.8)
 
     assert point["threshold"] == 0.75 and point["recall"] == 1.0
-    assert point["false_blobs_per_cm2"] == 0
+    assert point["false_blobs_per_cm2"] == 0 and point["false_blobs_2plus_per_cm2"] == 0
     assert point["spill"] == pytest.approx((145 - 23) / 145)
     assert operating_point(curve, 0.5)["threshold"] == 0.85
     assert operating_point(curve, 1.01) is None
@@ -402,16 +406,20 @@ def test_operating_point_takes_the_largest_threshold_reaching_the_recall(geometr
 def test_summary_names_folds_that_never_reach_a_target_and_leaves_them_out() -> None:
     curves = {
         1: pd.DataFrame({"threshold": [0.2, 0.6], "recall": [0.95, 0.85], "n_scorable": [5, 5],
-                         "false_blobs_per_cm2": [4.0, 2.0], "spill": [0.5, 0.3]}),
+                         "false_blobs_per_cm2": [4.0, 2.0], "spill": [0.5, 0.3],
+                         "false_blobs_2plus_per_cm2": [1.0, 0.5]}),
         2: pd.DataFrame({"threshold": [0.2, 0.6], "recall": [0.82, 0.7], "n_scorable": [5, 5],
-                         "false_blobs_per_cm2": [6.0, 3.0], "spill": [0.6, 0.4]}),
+                         "false_blobs_per_cm2": [6.0, 3.0], "spill": [0.6, 0.4],
+                         "false_blobs_2plus_per_cm2": [3.0, 1.5]}),
         3: pd.DataFrame({"threshold": [0.2, 0.6], "recall": [np.nan, np.nan], "n_scorable": [0, 0],
-                         "false_blobs_per_cm2": [1.0, 1.0], "spill": [0.1, 0.1]}),
+                         "false_blobs_per_cm2": [1.0, 1.0], "spill": [0.1, 0.1],
+                         "false_blobs_2plus_per_cm2": [1.0, 1.0]}),
     }
 
     summary = summarise_operating_points(curves, targets=(0.8, 0.9))
 
     assert summary["recall_0.80"]["false_blobs_per_cm2"] == {"mean": 4.0, "min": 2.0, "max": 6.0}
+    assert summary["recall_0.80"]["false_blobs_2plus_per_cm2"] == {"mean": 1.75, "min": 0.5, "max": 3.0}
     assert summary["recall_0.80"]["folds_not_reaching"] == []
     assert summary["recall_0.90"]["folds_not_reaching"] == [2]
     assert summary["recall_0.90"]["spill"] == {"mean": 0.5, "min": 0.5, "max": 0.5}
@@ -484,7 +492,10 @@ def test_cells_meeting_only_at_a_corner_are_separate_blobs(geometry) -> None:
     probabilities = pd.Series({tile: 0.1 for tile in geometry.cells["tile_id"]})
     probabilities[["t_r0_c3", "t_r1_c2"]] = 0.7
 
-    assert list(false_blob_counts(geometry, probabilities, np.array([0.5]))) == [2]
+    counts, multi_cell = false_blob_counts(geometry, probabilities, np.array([0.5]))
+
+    assert list(counts) == [2]
+    assert list(multi_cell) == [0]
 
 
 
@@ -555,3 +566,35 @@ def test_fold_curve_refuses_a_cut_with_oocytes_missing_from_the_table(tmp_path: 
     with pytest.raises(ValueError, match="no rows in the per-oocyte table"):
         fold_curve([geometry, other], probabilities, per_oocyte_table(geometry, probabilities, 1),
                    np.array([0.5]))
+
+
+
+def test_a_single_cell_false_blob_is_left_out_of_the_two_plus_count(geometry) -> None:
+    probabilities = pd.Series({tile: 0.1 for tile in geometry.cells["tile_id"]})
+    probabilities[["t_r0_c3", "t_r1_c3", "t_r2_c1"]] = 0.7
+
+    counts, multi_cell = false_blob_counts(geometry, probabilities, np.array([0.5]))
+
+    assert list(counts) == [2]
+    assert list(multi_cell) == [1]
+
+
+
+def test_an_empty_edge_cell_never_forms_or_grows_a_false_blob(tmp_path: Path) -> None:
+    manifest = _manifest(skip=None)
+    manifest["level0_bbox"]["x1"] = 100 + 25
+    for tile in manifest["tiles"]:
+        bbox = tile["cut_local_bbox"]
+        bbox["x1"] = min(bbox["x1"], 25)
+        tile["pad_right"] = TILE - (bbox["x1"] - bbox["x0"])
+    scored = {tile["tile_id"] for tile in manifest["tiles"]}
+    geometry = cut_geometry(manifest, _geojson(tmp_path, {"Oosorption Stage 0": _square(1, 1, 4, 4)}),
+                            TILE, scored)
+    probabilities = pd.Series({tile: 0.1 for tile in scored})
+    probabilities[["t_r1_c2", "t_r1_c3", "t_r2_c3"]] = 0.9
+
+    counts, multi_cell = false_blob_counts(geometry, probabilities, np.array([0.5]))
+
+    assert geometry.cells.set_index("tile_id").loc["t_r1_c3", "area"] == 0
+    assert list(counts) == [1]
+    assert list(multi_cell) == [0]

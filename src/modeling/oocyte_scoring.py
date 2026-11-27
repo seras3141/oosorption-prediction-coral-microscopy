@@ -29,7 +29,9 @@ MIN_SCORABLE_SHARE = 0.5
 OPERATING_RECALLS = (0.80, 0.90)
 UM2_PER_CM2 = 1e8
 DEFAULT_OUTPUT_ROOT = "data/tile_classifier_cv/oocyte_scores"
-NOISE_FLOOR_METRICS = ("false_blobs_per_cm2", "spill", "threshold")
+MULTI_CELL_BLOB = 2
+OPERATING_METRICS = ("false_blobs_per_cm2", "false_blobs_2plus_per_cm2", "spill", "threshold")
+NOISE_FLOOR_METRICS = OPERATING_METRICS
 # Areas summed in a different order differ by rounding.
 COVERAGE_RTOL = 1e-9
 
@@ -203,7 +205,7 @@ def oocyte_coverage(geometry: CutGeometry, probabilities: pd.Series, threshold: 
 
 
 def _span(index: int, offset: float, stride: int, extent: int) -> tuple[float, float]:
-    # Last tile within offset owns empty cell.
+    # Cells starting past the edge are empty.
     low = 0.0 if index == 0 else min(offset + index * stride, extent)
     high = min(offset + (index + 1) * stride, extent)
     return low, high
@@ -244,8 +246,8 @@ def per_oocyte_table(geometry: CutGeometry, probabilities: pd.Series, fold: int)
 
 
 def false_blob_counts(geometry: CutGeometry, probabilities: pd.Series,
-                      thresholds: np.ndarray) -> np.ndarray:
-    """Per threshold, the 4-connected groups of positive cells that touch no annotation."""
+                      thresholds: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Per threshold, 4-connected positive groups touching no annotation: all, and 2+ cells."""
     cells = geometry.cells
     numeric = pd.to_numeric(probabilities).reindex(cells["tile_id"]).to_numpy()
     if np.isnan(numeric).any():
@@ -254,15 +256,20 @@ def false_blob_counts(geometry: CutGeometry, probabilities: pd.Series,
     rows, cols = cells["row"].to_numpy(), cells["col"].to_numpy()
     touches = np.zeros(shape, dtype=bool)
     touches[rows, cols] = cells["annotation_area"].to_numpy() > 0
+    has_area = cells["area"].to_numpy() > 0
     counts = np.zeros(len(thresholds), dtype=np.int64)
+    multi_cell = np.zeros(len(thresholds), dtype=np.int64)
     for i, threshold in enumerate(thresholds):
         positive = np.zeros(shape, dtype=bool)
-        positive[rows, cols] = numeric >= threshold
+        positive[rows, cols] = (numeric >= threshold) & has_area
         labels, n_blobs = ndimage.label(positive)
         if n_blobs:
             touched = np.bincount(labels[touches & positive], minlength=n_blobs + 1)[1:]
-            counts[i] = int((touched == 0).sum())
-    return counts
+            size = np.bincount(labels[positive], minlength=n_blobs + 1)[1:]
+            false = touched == 0
+            counts[i] = int(false.sum())
+            multi_cell[i] = int((false & (size >= MULTI_CELL_BLOB)).sum())
+    return counts, multi_cell
 
 
 def fold_curve(geometries: list[CutGeometry], probabilities: pd.Series,
@@ -286,6 +293,7 @@ def fold_curve(geometries: list[CutGeometry], probabilities: pd.Series,
     positive_um2 = np.zeros(len(thresholds))
     outside_um2 = np.zeros(len(thresholds))
     false_blobs = np.zeros(len(thresholds), dtype=np.int64)
+    false_blobs_2plus = np.zeros(len(thresholds), dtype=np.int64)
     scored_um2 = 0.0
     for geometry in geometries:
         cells = geometry.cells
@@ -299,7 +307,9 @@ def fold_curve(geometries: list[CutGeometry], probabilities: pd.Series,
         outside_from = np.concatenate([np.cumsum(outside[order][::-1])[::-1], [0.0]])
         positive_um2 += area_from[first_positive]
         outside_um2 += outside_from[first_positive]
-        false_blobs += false_blob_counts(geometry, numeric, thresholds)
+        all_blobs, multi_cell = false_blob_counts(geometry, numeric, thresholds)
+        false_blobs += all_blobs
+        false_blobs_2plus += multi_cell
         scored_um2 += float(area.sum())
 
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -312,6 +322,9 @@ def fold_curve(geometries: list[CutGeometry], probabilities: pd.Series,
         "positive_um2": positive_um2,
         "false_blobs": false_blobs,
         "false_blobs_per_cm2": false_blobs / (scored_um2 / UM2_PER_CM2) if scored_um2 else np.nan,
+        "false_blobs_2plus": false_blobs_2plus,
+        "false_blobs_2plus_per_cm2": (false_blobs_2plus / (scored_um2 / UM2_PER_CM2)
+                                      if scored_um2 else np.nan),
         "spill": spill,
     })
 
@@ -323,7 +336,7 @@ def operating_point(curve: pd.DataFrame, target_recall: float) -> dict[str, floa
         return None
     row = reached.loc[reached["threshold"].idxmax()]
     return {key: float(row[key]) for key in
-            ("threshold", "recall", "false_blobs_per_cm2", "spill")}
+            ("recall", *OPERATING_METRICS)}
 
 
 def summarise_operating_points(curves: dict[int, pd.DataFrame],
@@ -336,7 +349,7 @@ def summarise_operating_points(curves: dict[int, pd.DataFrame],
         points = {fold: operating_point(curve, target) for fold, curve in judged.items()}
         reached = {fold: point for fold, point in points.items() if point is not None}
         metrics = {}
-        for metric in ("false_blobs_per_cm2", "spill", "threshold"):
+        for metric in OPERATING_METRICS:
             values = [point[metric] for point in reached.values()]
             metrics[metric] = ({"mean": float(np.mean(values)), "min": float(np.min(values)),
                                 "max": float(np.max(values))} if values else None)
@@ -481,6 +494,15 @@ def noise_floor(summaries: list[dict[str, Any]]) -> dict[str, Any]:
                   for summary in summaries}
         if len(values) > 1:
             raise ValueError(f"the runs disagree on {key}: {sorted(values)}")
+    for summary in summaries:
+        for target, point in summary["operating_points"].items():
+            for fold, values in point["per_fold"].items():
+                missing = sorted(set(NOISE_FLOOR_METRICS) - set(values))
+                if missing:
+                    raise ValueError(
+                        f"{summary['cv_run_id']} {target} fold {fold} lacks {missing}; it was "
+                        "scored by an older version, so rescore it with --overwrite"
+                    )
     run_ids = [summary["cv_run_id"] for summary in summaries]
     if len(set(run_ids)) < len(run_ids):
         raise ValueError(f"a run appears more than once: {run_ids}")

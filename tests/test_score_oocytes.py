@@ -394,3 +394,13 @@ def test_the_noise_floor_records_its_inputs_and_exclusion_list(tmp_path: Path) -
 
     assert floor["inputs"]["seed42"]["predictions_sha256"] == summaries[0]["predictions_sha256"]
     assert floor["cut_exclusions"] == summaries[0]["cut_exclusions"]
+
+
+
+def test_a_noise_floor_over_summaries_scored_before_a_metric_existed_is_refused(tmp_path: Path) -> None:
+    summaries = _summaries(tmp_path)
+    for values in summaries[1]["operating_points"]["recall_0.90"]["per_fold"].values():
+        values.pop("false_blobs_2plus_per_cm2")
+
+    with pytest.raises(ValueError, match="rescore it with --overwrite"):
+        noise_floor(summaries)
