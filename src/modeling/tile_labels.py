@@ -35,7 +35,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from shapely import make_valid
 from shapely.geometry import Polygon, box
@@ -93,26 +93,41 @@ def load_annotation_polygons(annotations_geojson_path: str | Path) -> list[BaseG
     >>> MIN_RING_COORDS
     3
     """
+    return [feature.polygon for feature in load_annotation_features(annotations_geojson_path)]
+
+
+class AnnotationFeature(NamedTuple):
+    """A usable annotation: its position among the GeoJSON features, geometry and properties."""
+
+    position: int
+    polygon: BaseGeometry
+    properties: dict[str, Any]
+
+
+def load_annotation_features(annotations_geojson_path: str | Path) -> list[AnnotationFeature]:
+    """Each usable annotation's repaired geometry and GeoJSON properties."""
     path = _resolve_repo_path(annotations_geojson_path)
     geojson = _read_json(path)
     if geojson.get("type") != FEATURE_COLLECTION:
         raise ValueError(f"{path} is not a GeoJSON FeatureCollection")
 
     features = geojson.get("features") or []
-    polygons: list[BaseGeometry] = []
+    annotation_features: list[AnnotationFeature] = []
     for feature_pos, feature in enumerate(features):
         polygon = _polygon_from_feature(feature, path, feature_pos)
         if polygon is not None:
-            polygons.append(polygon)
+            annotation_features.append(
+                AnnotationFeature(feature_pos, polygon, feature.get("properties") or {})
+            )
 
-    if features and not polygons:
+    if features and not annotation_features:
         raise ValueError(
             f"{path} has {len(features)} feature(s) but none yielded a usable polygon; "
             "refusing to report zero oocyte coverage for a cut that has annotations"
         )
     if not features:
         LOG.info("%s has no annotation features", path.name)
-    return polygons
+    return annotation_features
 
 
 def compute_oocyte_area_fractions(

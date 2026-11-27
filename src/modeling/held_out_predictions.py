@@ -2,13 +2,9 @@
 
 from __future__ import annotations
 
-import errno
 import hashlib
 import io
 import json
-import os
-import shutil
-import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,8 +21,8 @@ from src.modeling.cross_validation import (
     check_fold_isolation,
     load_fold_manifest,
 )
-from src.modeling.embedding_cache import _swap_into_place
 from src.modeling.evaluate_tile_classifier import _predict, _restore_model
+from src.modeling.output_dirs import publish_directory, refuse_existing
 from src.modeling.tile_index import _resolve_repo_path, load_tile_index
 from src.modeling.tile_labels import LABEL_NEGATIVE
 from src.modeling.train_tile_classifier import TrainingConfig, load_config_cache
@@ -300,12 +296,7 @@ def write_held_out_predictions(cv_run: CvRun, predictions: pd.DataFrame,
                                output_root: str | Path = DEFAULT_OUTPUT_ROOT,
                                overwrite: bool = False) -> Path:
     """Write ``predictions.csv`` and ``provenance.json`` through a staging directory."""
-    out_dir = output_dir_for(cv_run, output_root)
-    out_dir.parent.mkdir(parents=True, exist_ok=True)
-    staging = out_dir.with_name(f".{out_dir.name}.staging-{uuid.uuid4().hex}")
-    # mkdir, unlike mkdtemp, keeps the group-readable umask.
-    staging.mkdir()
-    try:
+    def write(staging: Path) -> None:
         predictions.to_csv(staging / "predictions.csv", index=False)
         provenance = {
             "cv_run_id": cv_run.cv_results["cv_run_id"],
@@ -324,23 +315,8 @@ def write_held_out_predictions(cv_run: CvRun, predictions: pd.DataFrame,
         (staging / "provenance.json").write_text(
             json.dumps(provenance, indent=2, allow_nan=False) + "\n", encoding="utf-8"
         )
-        if overwrite:
-            _swap_into_place(staging, out_dir)
-        else:
-            _refuse_existing(out_dir, overwrite)
-            # rename refuses a non-empty target directory.
-            try:
-                os.rename(staging, out_dir)
-            except OSError as exc:
-                if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
-                    raise FileExistsError(
-                        f"{out_dir} came to exist while this run was predicting"
-                    ) from exc
-                raise
-    finally:
-        if staging.exists():
-            shutil.rmtree(staging)
-    return out_dir
+
+    return publish_directory(output_dir_for(cv_run, output_root), write, overwrite)
 
 
 def run_held_out_predictions(cv_results_path: str | Path,
@@ -355,7 +331,7 @@ def run_held_out_predictions(cv_results_path: str | Path,
             "scored on CPU; pass device='cpu' only for a run evaluated on CPU"
         )
     cv_run = load_cv_run(cv_results_path)
-    _refuse_existing(output_dir_for(cv_run, output_root), overwrite)
+    refuse_existing(output_dir_for(cv_run, output_root), overwrite)
     held_out = collect_held_out_tiles(cv_run)
     predictions, records = predict_held_out_tiles(cv_run, held_out, torch_device, num_workers)
     return write_held_out_predictions(cv_run, predictions, records, str(torch_device),
@@ -380,13 +356,6 @@ def _device_details(device: str) -> dict[str, Any]:
         "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
         "matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
     }
-
-
-def _refuse_existing(out_dir: Path, overwrite: bool) -> None:
-    if out_dir.exists() and not overwrite:
-        raise FileExistsError(
-            f"{out_dir} already exists; pass overwrite=True (--overwrite) to replace it"
-        )
 
 
 def _load_fold_run(summary: dict[str, Any], fold_manifest: dict[str, Any]) -> FoldRun:

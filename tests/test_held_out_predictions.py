@@ -20,7 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.modeling import held_out_predictions
+from src.modeling import held_out_predictions, output_dirs
 from src.modeling.cut_exclusions import LEGACY_CORPUS
 from src.modeling.held_out_predictions import (
     OUTPUT_COLUMNS,
@@ -621,7 +621,7 @@ def test_overwrite_replaces_an_existing_output(
     assert sorted(p.name for p in out_dir.iterdir()) == ["predictions.csv", "provenance.json"]
 
 
-@pytest.mark.parametrize("overwrite, failing", [(False, "rename"), (True, "_swap_into_place")])
+@pytest.mark.parametrize("overwrite, failing", [(False, "rename"), (True, "swap_into_place")])
 def test_a_failed_write_leaves_no_staging_directory(
     run_files: CvRunFiles, index_calls: list[dict], monkeypatch: pytest.MonkeyPatch,
     overwrite: bool, failing: str
@@ -629,7 +629,7 @@ def test_a_failed_write_leaves_no_staging_directory(
     def fail(*args):
         raise OSError("disk full")
 
-    target = held_out_predictions.os if failing == "rename" else held_out_predictions
+    target = output_dirs.os if failing == "rename" else output_dirs
     monkeypatch.setattr(target, failing, fail)
     cv_run = load_cv_run(run_files.cv_results_path)
 
@@ -807,9 +807,9 @@ def test_an_output_written_concurrently_survives_a_run_without_overwrite(
     concurrent = run_files.root / "out" / "cv1"
     concurrent.mkdir(parents=True)
     (concurrent / "predictions.csv").write_text("other job", encoding="utf-8")
-    monkeypatch.setattr(held_out_predictions, "_refuse_existing", lambda out_dir, overwrite: None)
+    monkeypatch.setattr(output_dirs, "refuse_existing", lambda out_dir, overwrite: None)
 
-    with pytest.raises(FileExistsError, match="came to exist while this run was predicting"):
+    with pytest.raises(FileExistsError, match="came to exist while this run was writing"):
         write_held_out_predictions(cv_run, pd.DataFrame({"is_ambiguous": [False]}), [], "cpu",
                                    output_root=run_files.root / "out")
     assert (concurrent / "predictions.csv").read_text(encoding="utf-8") == "other job"
